@@ -1,96 +1,93 @@
-# Trae Local API
+# trae-solo-local-api
 
-把 **TRAE SOLO** 包装成本地 OpenAI / Anthropic 兼容 API，给 Claude Code、Cursor、Cline 等调用 SOLO 底层模型（GLM-5.2、DeepSeek、Qwen、Doubao…）。
+把 **TRAE SOLO** 包装成本地 OpenAI / Anthropic 兼容 API，供 Claude Code、Cursor、Cline 等调用 SOLO 底层模型。
 
-> **为何用 SOLO 而不是 Trae CN？**  
-> Trae CN 指定模型多走 `chat_v3` 通用池，热门模型排队很重（常见上千）。  
-> TRAE SOLO 走 `solo_work_lite` 等产品池，**排队明显更轻**。本项目默认按 SOLO 对齐。
+- **本仓库**：https://github.com/Ttungx/trae-solo-local-api  
+- **上游原项目**：https://github.com/ZedeX/trae-local-api  
+
+本仓库是 SOLO 适配分支，不是官方上游。
+
+### 相对上游的主要改动
+
+| 改动 | 说明 |
+|---|---|
+| 数据目录 | 优先 `%APPDATA%\TRAE SOLO CN`，并用 `APPDATA`（支持重定向盘） |
+| 功能池 | 指定模型走 `solo_work_lite`，避免 Trae CN 的 `chat_v3` 重排队 |
+| Header | SOLO device id（`icube-dc`）、`appVersion`、`x-flow-traceparent` 等 |
+| OAuth | SOLO ClientID 默认 `en1oxy7wnw8j9n` |
+| 排队降级 | OpenAI `/v1/chat/completions` 也支持超阈值换模型 |
+| 模型表 | 补充 SOLO 侧模型/别名与 fallback |
+| 文档 | 短 README + `SOLO_PARITY.md` / `TODO.md`；去掉上游冗长进度/教程副本 |
+
+> **排队**：Trae CN `chat_v3` 很重；SOLO `solo_work_lite` 较轻。默认按 SOLO。
+
+未完成：完整复刻 SOLO `create_agent_task`（~200KB body）— 见 `TODO.md`。
 
 ## 快速开始
 
-1. 安装并登录 [TRAE SOLO](https://trae.cn/)，能正常对话。
-2. Node.js ≥ 18。
-3. 安装并配置：
+1. 安装并登录 [TRAE SOLO](https://trae.cn/)，能正常对话  
+2. Node.js ≥ 18  
 
 ```bash
-git clone <this-repo> trae-local-api
-cd trae-local-api
+git clone https://github.com/Ttungx/trae-solo-local-api.git
+cd trae-solo-local-api
 npm install
 cp .env.example .env
-# 默认 TRAE_PRODUCT=solo，一般不用改
+# 默认 TRAE_PRODUCT=solo
 npm start
 ```
 
-服务：`http://localhost:19900`  
-默认 Key：`.env` 里 `API_KEY`（示例 `trae-local-api-key`）
-
-数据目录（自动探测，也可手写）：
-
-```text
-%APPDATA%\TRAE SOLO CN\User\globalStorage\storage.json
-```
+- 服务：`http://localhost:19900`
+- Key：`.env` 的 `API_KEY`（示例 `trae-solo-local-api-key`）
+- 数据：`%APPDATA%\TRAE SOLO CN\User\globalStorage\storage.json`
 
 ## 验证
 
 ```bash
-curl -s http://localhost:19900/v1/status -H "Authorization: Bearer trae-local-api-key"
+curl -s http://localhost:19900/v1/status -H "Authorization: Bearer trae-solo-local-api-key"
 
 curl -s http://localhost:19900/v1/chat/completions \
-  -H "Authorization: Bearer trae-local-api-key" \
+  -H "Authorization: Bearer trae-solo-local-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
-日志应类似：`function=solo_work_lite, config_name=glm-5.2`。
+日志应含：`function=solo_work_lite, config_name=glm-5.2`。
 
-| 模型参数 | 后端 | 排队 |
+| 参数 | 后端 | 排队 |
 |---|---|---|
 | `auto` | `inline_chat` | 很轻 |
-| `glm-5.2` 等 | `solo_work_lite`（SOLO） | 较轻 |
-| 旧路径 `chat_v3`（Trae CN 风格） | 通用池 | **很重，不推荐** |
+| `glm-5.2` 等 | `solo_work_lite` | 较轻 |
+| `chat_v3`（CN 风格） | 通用池 | 很重，不推荐 |
 
 ## 客户端
 
-**Claude Code (PowerShell)**
-
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://localhost:19900"
-$env:ANTHROPIC_API_KEY = "trae-local-api-key"
+$env:ANTHROPIC_API_KEY = "trae-solo-local-api-key"
 claude
 ```
 
-**Cursor / Cline**：Base URL `http://localhost:19900/v1`，Key 同上，Model `auto` 或 `glm-5.2`。
+Cursor/Cline：Base URL `http://localhost:19900/v1`，Key 同上，Model `auto` / `glm-5.2`。
 
-**Python**
+## 目录
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:19900/v1", api_key="trae-local-api-key")
-print(client.chat.completions.create(
-    model="glm-5.2",
-    messages=[{"role": "user", "content": "hi"}],
-).choices[0].message.content)
+```text
+src/           服务与 Trae/SOLO 客户端
+web/           Dashboard
+scripts/       模型拉取 / SOLO probe
+model-config.json
+SOLO_PARITY.md  对齐细节
+TODO.md         未完成项
+.env.example
 ```
 
-## 功能摘要
-
-- OpenAI `/v1/chat/completions` + Anthropic `/v1/messages`
-- 自动读 SOLO 本地 JWT，CN/SOLO `tc` 解密，token 刷新
-- 模型分档 + 排队降级；多模态自动切模型
-- Dashboard：`http://localhost:19900/`
-
-更多对齐细节与未完成项：[`SOLO_PARITY.md`](./SOLO_PARITY.md)、[`TODO.md`](./TODO.md)。  
-环境变量模板：[`.env.example`](./.env.example)。
-
-## 常见问题
+## FAQ
 
 | 问题 | 处理 |
 |---|---|
-| `No readable auth info found` | 先登录 SOLO 并对话一次；检查 `%APPDATA%\TRAE SOLO CN\...storage.json`，或设 `TRAE_DATA_DIR` |
-| 指定模型仍很慢/像排队 | 确认日志是 `solo_work_lite` 不是 `chat_v3`；`TRAE_PRODUCT=solo` |
-| 解密失败 / 401 | 重开 SOLO 刷新登录；或 `.env` 设 `TRAE_MANUAL_TOKEN` |
-| token 过期 | 服务会尝试 refresh；失败则重登 SOLO 后重启本服务 |
+| 无 auth | 登录 SOLO 并对话；检查 storage 或设 `TRAE_DATA_DIR` |
+| 指定模型慢 | 日志须为 `solo_work_lite` 不是 `chat_v3` |
+| 解密失败 / 401 | 重登 SOLO 或 `TRAE_MANUAL_TOKEN` |
 
-## 许可证
-
-仅供学习研究。遵守 Trae / SOLO 服务条款。
+仅供学习研究。遵守 SOLO/Trae 服务条款。

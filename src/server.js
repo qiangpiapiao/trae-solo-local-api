@@ -32,7 +32,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const API_KEY = process.env.API_KEY || 'trae-local-api-key';
+const API_KEY = process.env.API_KEY || 'trae-solo-local-api-key';
 const PORT = process.env.PORT || 19900;
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || '';
 const OUTPUT_SYNC_DIR = process.env.OUTPUT_SYNC_DIR || '';

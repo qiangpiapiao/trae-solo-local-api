@@ -1,15 +1,14 @@
 {
-  "name": "trae-local-api",
+  "name": "trae-solo-local-api",
   "version": "2.2.0",
   "description": "Trae IDE / TRAE SOLO local OpenAI & Anthropic compatible API",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node tests/test-all.js",
+    "test": "vitest run tests/server",
     "test:unit": "vitest run tests/server",
-    "test:e2e": "vitest run tests/e2e",
-    "test:vitest": "vitest run"
+    "test:e2e": "vitest run tests/e2e"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.98.0",

@@ -13,6 +13,9 @@
 
 ## 已对齐（可用）
 
+本仓库：https://github.com/Ttungx/trae-solo-local-api  
+上游：https://github.com/ZedeX/trae-local-api  
+
 ### 认证
 - 目录：`%APPDATA%\TRAE SOLO CN\User\globalStorage\storage.json`
 - 解密 `iCubeAuthInfo://icube.cloudide`（tc / AES-128-CBC）
