@@ -1,6 +1,6 @@
 # trae-solo-local-api
 
-把 **TRAE SOLO** 包装成本地 OpenAI / Anthropic 兼容 API，供 Claude Code、Cursor、Cline 等调用 SOLO 底层模型。
+把 **TRAE SOLO(Trae Work)** 包装成本地 OpenAI / Anthropic 兼容 API，供 Claude Code、Cursor、Cline 等调用 SOLO 底层模型。
 
 - **本仓库**：https://github.com/Ttungx/trae-solo-local-api  
 - **上游原项目**：https://github.com/ZedeX/trae-local-api  
