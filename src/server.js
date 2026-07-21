@@ -8,7 +8,7 @@ const PACKAGE_VERSION = require('../package.json').version;
 
 const { getAuthInfo, getDeviceIds, isTokenExpired, getApiHost, refreshTokenIfNeeded, detectEdition } = require('./auth');
 const { llmUtilsChat, chatCompletion, createAgentTask, getModelDetailParam, getChatModes, resolveModelId, MODEL_MAP, REVERSE_MODEL_MAP, FUNCTION_MAP, getFallbackConfig, saveFallbackConfig, getFallbackChain, getRaceModels, isRaceFallbackEnabled, getTiers, getModelsInTier, getTierOfModel, isTieredFallbackEnabled, isRaceWithinTierEnabled, getFallbackModel, getSameTierModels, getNextTierModels, findMultimodalModel, getModelConfig, saveModelConfig, rebuildDerivedMaps } = require('./trae-client');
-const { createOpenAIChatCompletion, createOpenAIStreamChunk, createOpenAIModels, parseLlmUtilsChatStream, llmUtilsChunkToOpenAI, parseAgentTaskStream, parseTraeStreamChunk, traeChunkToOpenAI } = require('./openai-format');
+const { createOpenAIChatCompletion, createOpenAIStreamChunk, createOpenAIModels, parseLlmUtilsChatStream, llmUtilsChunkToOpenAI, parseAgentTaskStream, parseTraeStreamChunk, traeChunkToOpenAI, extractToolcallsFromText, createOpenAIToolcallStreamFilter, buildOpenAIToolCallStreamDeltas } = require('./openai-format');
 const {
   createAnthropicMessage,
   createAnthropicMessageStart,
@@ -158,18 +158,21 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
   let persisted = false;
   let abortedForFallback = false;
   let lastQueuePosition = 0;
+  let streamEnded = false;
+  const collectedToolCalls = [];
+  const toolFilter = createOpenAIToolcallStreamFilter(parseToolcallContent);
   const control = streamControl || null;
 
   const finalizeLlmLog = () => {
     if (llmFinalized) return;
     llmFinalized = true;
-    if (logId) trafficLogger.finalizeLog(logId, { fullContent, fullReasoning, tokenUsage });
+    if (logId) trafficLogger.finalizeLog(logId, { fullContent, fullReasoning, tokenUsage, toolCalls: collectedToolCalls });
   };
 
   const persistOnce = () => {
     if (persisted || !onComplete) return;
     persisted = true;
-    try { onComplete(fullContent, fullReasoning, tokenUsage); }
+    try { onComplete(fullContent, fullReasoning, tokenUsage, collectedToolCalls); }
     catch (e) { console.error('[persist] onComplete error:', e); }
   };
 
@@ -177,8 +180,93 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
     try { if (responseBody && responseBody.destroy) responseBody.destroy(); } catch (e) {}
   };
 
+  const writeToolCallChunks = (toolCalls) => {
+    if (!toolCalls || !toolCalls.length || res.writableEnded) return;
+    const mapped = applyToolMapToToolCalls(toolCalls, control?.toolMap);
+    for (const tc of mapped) {
+      if (tc.index == null) tc.index = collectedToolCalls.length;
+      // Two-phase OpenAI tool_call deltas for stricter clients (OpenCode etc.)
+      const phases = buildOpenAIToolCallStreamDeltas(tc);
+      for (const delta of phases) {
+        const chunk = createOpenAIStreamChunk(completionId, modelName, delta, null);
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+      collectedToolCalls.push(tc);
+    }
+    // Flush SSE promptly so clients don't stall waiting for end-of-buffer
+    if (typeof res.flush === 'function') {
+      try { res.flush(); } catch (e) {}
+    }
+  };
+
+  const writeTextDelta = (text) => {
+    if (!text || res.writableEnded) return;
+    const tChunk = createOpenAIStreamChunk(completionId, modelName, { content: text }, null);
+    res.write(`data: ${JSON.stringify(tChunk)}\n\n`);
+    if (typeof res.flush === 'function') {
+      try { res.flush(); } catch (e) {}
+    }
+  };
+
+  const writeReasoningDelta = (text) => {
+    if (!text || res.writableEnded) return;
+    const rChunk = createOpenAIStreamChunk(completionId, modelName, { reasoning_content: text }, null);
+    res.write(`data: ${JSON.stringify(rChunk)}\n\n`);
+    if (typeof res.flush === 'function') {
+      try { res.flush(); } catch (e) {}
+    }
+  };
+
+  const finishStream = (finishReason) => {
+    if (streamEnded || res.writableEnded) return;
+    streamEnded = true;
+    // Flush any buffered partial toolcall filter (may salvage complete JSON)
+    try {
+      const flushed = toolFilter.flush();
+      if (flushed.emitText) {
+        fullContent += flushed.emitText;
+        writeTextDelta(flushed.emitText);
+      }
+      if (flushed.finishedToolCalls && flushed.finishedToolCalls.length) {
+        writeToolCallChunks(flushed.finishedToolCalls);
+      }
+    } catch (e) {}
+
+    if (saveToPath && fullContent) {
+      try {
+        const dir = path.dirname(saveToPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(saveToPath, fullContent, 'utf-8');
+        console.log(`[file] Saved to: ${saveToPath}`);
+        syncFileToOutput(saveToPath);
+        const savedChunk = createOpenAIStreamChunk(completionId, modelName, {
+          content: `\n\n[File saved: ${saveToPath}]`
+        }, null);
+        res.write(`data: ${JSON.stringify(savedChunk)}\n\n`);
+      } catch (fileErr) {
+        console.error(`[file] Save failed: ${fileErr.message}`);
+      }
+    }
+
+    persistOnce();
+
+    let reason = finishReason || 'stop';
+    // First-principles: if tools were emitted, clients must see tool_calls stop reason
+    if (collectedToolCalls.length > 0) {
+      reason = 'tool_calls';
+    }
+    const doneChunk = createOpenAIStreamChunk(completionId, modelName, {}, reason);
+    res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
+    finalizeLlmLog();
+    if (control && typeof control.onComplete === 'function') control.onComplete({ toolCalls: collectedToolCalls });
+  };
+
   const decideFallback = (position) => {
     if (!control || control.fallbackResolved) return null;
+    // Don't fallback mid-content if we already emitted tool calls / text
+    if (fullContent || fullReasoning || collectedToolCalls.length) return null;
     const fbConfig = getFallbackConfig() || {};
     if (!fbConfig.autoFallback || !(position > (fbConfig.queueThreshold || 300))) return null;
 
@@ -234,14 +322,14 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
   };
 
   responseBody.on('data', (chunk) => {
-    if (abortedForFallback || (control && control.fallbackResolved)) return;
+    if (abortedForFallback || (control && control.fallbackResolved) || streamEnded) return;
     try {
       buffer += chunk.toString();
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
       for (const line of lines) {
-        if (abortedForFallback) return;
+        if (abortedForFallback || streamEnded) return;
         const trimmed = line.trim();
         if (!trimmed) continue;
 
@@ -265,7 +353,6 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
               return;
             }
           }
-          // Keep connection alive during short queues; do not emit queue text into content.
           continue;
         }
 
@@ -280,54 +367,57 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
         }
 
         if (parsed.type === 'done') {
-          if (saveToPath && fullContent) {
-            try {
-              const dir = path.dirname(saveToPath);
-              if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-              fs.writeFileSync(saveToPath, fullContent, 'utf-8');
-              console.log(`[file] Saved to: ${saveToPath}`);
-              syncFileToOutput(saveToPath);
-              const savedChunk = createOpenAIStreamChunk(completionId, modelName, {
-                content: `\n\n[File saved: ${saveToPath}]`
-              }, null);
-              if (!res.writableEnded) res.write(`data: ${JSON.stringify(savedChunk)}\n\n`);
-            } catch (fileErr) {
-              console.error(`[file] Save failed: ${fileErr.message}`);
-              const errChunk = createOpenAIStreamChunk(completionId, modelName, {
-                content: `\n\n[File save failed: ${fileErr.message}]`
-              }, null);
-              if (!res.writableEnded) res.write(`data: ${JSON.stringify(errChunk)}\n\n`);
-            }
-          }
-
-          // Persist assistant message BEFORE res.end() so an abort after
-          // 'done' but before flush still has the row (grill-me G2: only on
-          // natural completion).
-          persistOnce();
-
-          if (!res.writableEnded) {
-            const doneChunk = createOpenAIStreamChunk(completionId, modelName, {}, parsed.finish_reason || 'stop');
-            res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
-          }
-
-          if (logId) trafficLogger.finalizeLog(logId, { fullContent, fullReasoning, tokenUsage });
-          if (control && typeof control.onComplete === 'function') control.onComplete();
+          finishStream(parsed.finish_reason || 'stop');
           return;
         }
 
-        const openaiChunk = llmUtilsChunkToOpenAI(parsed, completionId, modelName, true);
-        if (openaiChunk) {
-          if (parsed.type === 'text' && parsed.content) {
-            fullContent += parsed.content;
-            if (logId) trafficLogger.logResponseContent(logId, parsed.content, null);
-          }
-          if (parsed.type === 'text' && parsed.reasoning) {
+        // Native tool_calls from Trae output event
+        if (parsed.type === 'text' && parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
+          const mapped = parsed.tool_calls.map((tc, i) => {
+            const name = tc.name || tc.function?.name || tc.tool_name || '';
+            const args = tc.params != null ? tc.params
+              : (tc.arguments != null ? tc.arguments
+                : (tc.input != null ? tc.input
+                  : (tc.function?.arguments != null ? tc.function.arguments : {})));
+            return {
+              index: collectedToolCalls.length + i,
+              id: tc.id || `call_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
+              type: 'function',
+              function: {
+                name: String(name),
+                arguments: typeof args === 'string' ? args : JSON.stringify(args || {})
+              }
+            };
+          }).filter(tc => tc.function.name);
+          writeToolCallChunks(mapped);
+        }
+
+        // Stream text through toolcall filter so <toolcall> becomes tool_calls
+        if (parsed.type === 'text' && (parsed.content || parsed.reasoning)) {
+          if (parsed.reasoning) {
             fullReasoning += parsed.reasoning;
             if (logId) trafficLogger.logResponseContent(logId, null, parsed.reasoning);
+            writeReasoningDelta(parsed.reasoning);
           }
-          if (!res.writableEnded) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+          if (parsed.content) {
+            if (logId) trafficLogger.logResponseContent(logId, parsed.content, null);
+            const { emitText, finishedToolCalls } = toolFilter.feed(parsed.content);
+            if (emitText) {
+              fullContent += emitText;
+              writeTextDelta(emitText);
+            }
+            if (finishedToolCalls.length) {
+              console.log(`[openai ${control?.reqId || ''}] extracted ${finishedToolCalls.length} toolcall(s) from stream: ${finishedToolCalls.map(t => t.function.name).join(', ')}`);
+              writeToolCallChunks(finishedToolCalls);
+            }
+          }
+          continue;
+        }
+
+        // Fallback: other chunk types via original converter (errors etc.)
+        if (parsed.type === 'error') {
+          const openaiChunk = llmUtilsChunkToOpenAI(parsed, completionId, modelName, true);
+          if (openaiChunk && !res.writableEnded) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
         }
       }
     } catch (err) {
@@ -348,14 +438,7 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
 
   responseBody.on('end', () => {
     if (abortedForFallback) return;
-    if (!res.writableEnded) {
-      const doneChunk = createOpenAIStreamChunk(completionId, modelName, {}, 'stop');
-      res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-    }
-    finalizeLlmLog();
-    if (control && typeof control.onComplete === 'function') control.onComplete();
+    finishStream('stop');
   });
 
   responseBody.on('close', () => {
@@ -379,7 +462,7 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
 
 // OpenAI path queue-aware runner (mirrors Anthropic fallback behavior).
 async function runOpenAIChatWithFallback({
-  messages, modelName, options, res, completionId, saveToPath, persistAssistant, reqId, isStream
+  messages, modelName, options, res, completionId, saveToPath, persistAssistant, reqId, isStream, toolMap
 }) {
   const fallbackAttempted = {};
   let activeModel = modelName;
@@ -395,10 +478,11 @@ async function runOpenAIChatWithFallback({
     let finishReason = 'stop';
     let lastQueuePosition = 0;
     let fallbackDecision = null;
+    const nativeToolCalls = [];
     const upstreamLogId = result.logId;
 
     if (!result.body) {
-      return { fullContent, fullReasoning, tokenUsage, finishReason, fallbackDecision: null };
+      return { fullContent, fullReasoning, tokenUsage, finishReason, toolCalls: [], fallbackDecision: null };
     }
 
     await new Promise((resolve, reject) => {
@@ -413,6 +497,8 @@ async function runOpenAIChatWithFallback({
       };
 
       const maybeFallback = (position) => {
+        // Don't switch model after content started
+        if (fullContent || fullReasoning || nativeToolCalls.length) return null;
         const fbConfig = getFallbackConfig() || {};
         if (!fbConfig.autoFallback || !(position > (fbConfig.queueThreshold || 300))) return null;
         if (isTieredFallbackEnabled()) {
@@ -496,6 +582,24 @@ async function runOpenAIChatWithFallback({
             fullReasoning += parsed.reasoning;
             if (upstreamLogId) trafficLogger.logResponseContent(upstreamLogId, null, parsed.reasoning);
           }
+          if (parsed.type === 'text' && parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
+            for (const tc of parsed.tool_calls) {
+              const name = tc.name || tc.function?.name || tc.tool_name || '';
+              const args = tc.params != null ? tc.params
+                : (tc.arguments != null ? tc.arguments
+                  : (tc.input != null ? tc.input
+                    : (tc.function?.arguments != null ? tc.function.arguments : {})));
+              if (!name) continue;
+              nativeToolCalls.push({
+                id: tc.id || `call_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
+                type: 'function',
+                function: {
+                  name: String(name),
+                  arguments: typeof args === 'string' ? args : JSON.stringify(args || {})
+                }
+              });
+            }
+          }
         }
       });
       result.body.on('end', () => settle(resolve));
@@ -505,8 +609,16 @@ async function runOpenAIChatWithFallback({
       });
     });
 
-    if (upstreamLogId) trafficLogger.finalizeLog(upstreamLogId, { fullContent, fullReasoning, tokenUsage });
-    return { fullContent, fullReasoning, tokenUsage, finishReason, fallbackDecision };
+    // Extract <toolcall> tags from text content
+    const extracted = extractToolcallsFromText(fullContent, parseToolcallContent);
+    fullContent = extracted.text;
+    const toolCalls = [...nativeToolCalls, ...extracted.toolCalls];
+    if (toolCalls.length > 0 && (!finishReason || finishReason === 'stop')) {
+      finishReason = 'tool_calls';
+    }
+
+    if (upstreamLogId) trafficLogger.finalizeLog(upstreamLogId, { fullContent, fullReasoning, tokenUsage, toolCalls });
+    return { fullContent, fullReasoning, tokenUsage, finishReason, toolCalls, fallbackDecision };
   };
 
   // Non-stream: loop with fallback until content or no more fallbacks.
@@ -596,6 +708,8 @@ async function runOpenAIChatWithFallback({
         currentConfig: configNameOverride || resolveModelId(targetModel),
         fallbackAttempted,
         fallbackResolved: false,
+        reqId,
+        toolMap,
         onComplete: () => settle({ modelUsed: targetModel }),
         onFallback: async (decision) => {
           try {
@@ -618,6 +732,8 @@ async function runOpenAIChatWithFallback({
                       currentConfig: raceModel,
                       fallbackAttempted,
                       fallbackResolved: false,
+                      reqId,
+                      toolMap,
                       onComplete: () => resolveRace(),
                       onFallback: () => {
                         raceFellBack = true;
@@ -692,6 +808,217 @@ async function runOpenAIChatWithFallback({
   });
 }
 
+/**
+ * Normalize OpenAI chat messages for Trae:
+ * - convert tool role messages to <tool_result> text
+ * - convert assistant.tool_calls to <toolcall> text
+ * - inject tools schema into system prompt when present
+ * - preserve multimodal image parts
+ */
+function prepareOpenAIMessagesForTrae(messages, tools, reqId) {
+  const prepared = [];
+  let hasToolResult = false;
+  let hasToolUse = false;
+
+  for (const msg of messages || []) {
+    if (!msg || !msg.role) continue;
+
+    if (msg.role === 'tool') {
+      hasToolResult = true;
+      const toolCallId = msg.tool_call_id || msg.id || 'unknown';
+      const content = typeof msg.content === 'string' ? msg.content
+        : (msg.content != null ? JSON.stringify(msg.content) : '');
+      prepared.push({
+        role: 'user',
+        content: `<tool_result for="${toolCallId}">\n${content}\n</tool_result>`
+      });
+      continue;
+    }
+
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      hasToolUse = true;
+      let text = typeof msg.content === 'string' ? msg.content : (msg.content == null ? '' : String(msg.content));
+      for (const tc of msg.tool_calls) {
+        const name = tc.function?.name || tc.name || '';
+        let args = {};
+        const rawArgs = tc.function?.arguments != null ? tc.function.arguments : tc.arguments;
+        if (typeof rawArgs === 'string') {
+          try { args = JSON.parse(rawArgs); } catch (e) { args = { _raw: rawArgs }; }
+        } else if (rawArgs && typeof rawArgs === 'object') {
+          args = rawArgs;
+        }
+        text += `${text ? '\n' : ''}<toolcall>${JSON.stringify({ name, params: args })}</toolcall>`;
+      }
+      prepared.push({ role: 'assistant', content: text });
+      continue;
+    }
+
+    // Normal message
+    if (Array.isArray(msg.content)) {
+      const textParts = [];
+      const richParts = []; // keep image_url / structured parts if present
+      let hasRich = false;
+
+      for (const c of msg.content) {
+        if (typeof c === 'string') {
+          textParts.push(c);
+          continue;
+        }
+        if (!c || typeof c !== 'object') continue;
+
+        if (c.type === 'text') {
+          textParts.push(c.text || '');
+        } else if (c.type === 'image_url' || c.type === 'image') {
+          hasRich = true;
+          richParts.push(c);
+        } else if (c.type === 'tool_result') {
+          hasToolResult = true;
+          const cid = c.tool_call_id || c.tool_use_id || 'unknown';
+          const rc = typeof c.content === 'string' ? c.content : JSON.stringify(c.content || '');
+          textParts.push(`<tool_result for="${cid}">\n${rc}\n</tool_result>`);
+        } else if (c.type === 'tool_use' || c.type === 'function') {
+          hasToolUse = true;
+          const name = c.name || c.function?.name || '';
+          const input = c.input || c.params || {};
+          textParts.push(`<toolcall>${JSON.stringify({ name, params: input })}</toolcall>`);
+        } else if (c.type === 'input_text' && c.text) {
+          textParts.push(c.text);
+        } else if (c.type === 'input_image') {
+          hasRich = true;
+          richParts.push(c);
+        }
+      }
+
+      if (hasRich) {
+        // Preserve multimodal structure Trae understands (text + image_url)
+        const contentArr = [];
+        const joined = textParts.join('');
+        if (joined) contentArr.push({ type: 'text', text: joined });
+        contentArr.push(...richParts);
+        prepared.push({ role: msg.role, content: contentArr });
+      } else {
+        prepared.push({ role: msg.role, content: textParts.join('') });
+      }
+    } else {
+      prepared.push({ role: msg.role, content: msg.content });
+    }
+  }
+
+  // First principles: any tool result means we are in a continuation, even if
+  // the prior assistant tool_calls were already flattened by the client.
+  const isToolContinuation = hasToolResult;
+
+  let toolMap = null;
+
+  if (tools && Array.isArray(tools) && tools.length > 0) {
+    toolMap = {};
+    const compactLines = [];
+    for (const t of tools) {
+      // OpenAI tools: { type:'function', function:{ name, description, parameters } }
+      // Anthropic-style also seen: { name, description, input_schema }
+      const fn = t.function || t;
+      const name = fn.name || t.name || 'unknown';
+      const nameLower = name.toLowerCase();
+      toolMap[nameLower] = name;
+      if (nameLower === 'read' || nameLower === 'read_file') {
+        toolMap['read_file'] = name; toolMap['read'] = name;
+      }
+      if (nameLower === 'write' || nameLower === 'write_file') {
+        toolMap['write_file'] = name; toolMap['write'] = name;
+      }
+      if (nameLower === 'edit' || nameLower === 'edit_file' || nameLower === 'str_replace') {
+        toolMap['edit_file'] = name; toolMap['edit'] = name; toolMap['str_replace'] = name;
+      }
+      if (nameLower === 'bash' || nameLower === 'execute_command' || nameLower === 'run_command' || nameLower === 'shell') {
+        toolMap['execute_command'] = name; toolMap['bash'] = name; toolMap['run_command'] = name; toolMap['shell'] = name;
+      }
+      if (nameLower === 'glob' || nameLower === 'list_files' || nameLower === 'listdir') {
+        toolMap['glob'] = name; toolMap['list_files'] = name; toolMap['listdir'] = name;
+      }
+      if (nameLower === 'grep' || nameLower === 'search_files') {
+        toolMap['grep'] = name; toolMap['search_files'] = name;
+      }
+      if (nameLower === 'webfetch' || nameLower === 'web_fetch' || nameLower === 'fetch_url') {
+        toolMap['webfetch'] = name; toolMap['web_fetch'] = name; toolMap['fetch_url'] = name;
+      }
+      if (nameLower === 'websearch' || nameLower === 'web_search' || nameLower === 'search_internet') {
+        toolMap['websearch'] = name; toolMap['web_search'] = name; toolMap['search_internet'] = name;
+      }
+      const schema = fn.parameters || fn.input_schema || t.parameters || t.input_schema || {};
+      const params = schema.properties ? Object.keys(schema.properties).slice(0, 8).join(',') : '';
+      // Compact one-liner: name(params) — no long descriptions (OpenCode already ships tool docs)
+      compactLines.push(params ? `${name}(${params})` : name);
+    }
+
+    // Compact inject: protocol + name list only. Full per-tool essays double the system prompt
+    // (~20k tokens for 89 tools) and add ~2-4s TTFT with almost no benefit for OpenCode.
+    let toolSystemMsg =
+      `\n\n<toolcall_protocol>\n` +
+      `When you need a tool, output ONLY this XML block (valid JSON inside):\n` +
+      `<toolcall>{"name":"ToolName","params":{"arg":"value"}}</toolcall>\n` +
+      `Rules:\n` +
+      `- JSON must have "name" and "params"\n` +
+      `- Use EXACT tool names from the list (case-sensitive)\n` +
+      `- Do not wrap toolcall in markdown fences\n` +
+      `- After <tool_result>, continue until the user question is answered\n` +
+      `Tools (${compactLines.length}): ${compactLines.join(', ')}\n` +
+      `</toolcall_protocol>\n`;
+
+    if (isToolContinuation) {
+      toolSystemMsg +=
+        `\n<tool_continuation>\n` +
+        `User returned tool results in <tool_result> blocks. Read them, call more tools if needed, ` +
+        `or answer fully in plain text. Do not stop after one tool without answering.\n` +
+        `</tool_continuation>\n`;
+    }
+
+    const systemMsg = prepared.find(m => m.role === 'system');
+    if (systemMsg) {
+      // system content may be array for multimodal; normalize to string+append
+      if (typeof systemMsg.content === 'string') {
+        systemMsg.content = (systemMsg.content || '') + toolSystemMsg;
+      } else if (Array.isArray(systemMsg.content)) {
+        systemMsg.content.push({ type: 'text', text: toolSystemMsg });
+      } else {
+        systemMsg.content = toolSystemMsg.trim();
+      }
+    } else {
+      prepared.unshift({ role: 'system', content: toolSystemMsg.trim() });
+    }
+    if (reqId) {
+      console.log(`[openai ${reqId}] Injected ${tools.length} tools (compact list, ~${toolSystemMsg.length} chars), isToolContinuation=${isToolContinuation}`);
+    }
+  } else if (isToolContinuation) {
+    const cont = `\n\nIMPORTANT: Multi-turn tool use. Analyze <tool_result> blocks and continue. Call more tools if needed, otherwise give a complete answer. Do NOT stop prematurely.`;
+    const systemMsg = prepared.find(m => m.role === 'system');
+    if (systemMsg) {
+      if (typeof systemMsg.content === 'string') systemMsg.content = (systemMsg.content || '') + cont;
+      else if (Array.isArray(systemMsg.content)) systemMsg.content.push({ type: 'text', text: cont });
+      else systemMsg.content = cont.trim();
+    } else {
+      prepared.unshift({ role: 'system', content: cont.trim() });
+    }
+    if (reqId) console.log(`[openai ${reqId}] Tool continuation detected (no tools in request)`);
+  }
+
+  return { messages: prepared, toolMap, isToolContinuation, hasToolResult, hasToolUse };
+}
+
+function applyToolMapToToolCalls(toolCalls, toolMap) {
+  if (!toolCalls || !toolCalls.length || !toolMap) return toolCalls || [];
+  return toolCalls.map(tc => {
+    const name = tc.function?.name || '';
+    const mapped = toolMap[name.toLowerCase()] || name;
+    return {
+      ...tc,
+      function: {
+        ...tc.function,
+        name: mapped
+      }
+    };
+  });
+}
+
 function handleLegacyStream(responseBody, res, completionId, modelName) {
   let buffer = '';
 
@@ -747,16 +1074,19 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const { messages, model, stream, temperature, max_tokens, function: funcName, config_name, workspace_dir, save_to } = req.body;
+    const { messages: rawMessages, model, stream, temperature, max_tokens, function: funcName, config_name, workspace_dir, save_to, tools, tool_choice } = req.body;
 
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    if (!rawMessages || !Array.isArray(rawMessages) || rawMessages.length === 0) {
       return res.status(400).json({ error: { message: 'messages is required and must be a non-empty array', type: 'invalid_request_error' } });
     }
 
     const modelName = model || 'auto';
     const isStream = stream !== false;
 
-    console.log(`[openai ${reqId}] POST /v1/chat/completions model=${modelName} stream=${isStream} messages=${messages.length} function=${funcName || 'auto'}`);
+    // OpenCode / OpenAI clients send tools + tool role messages — normalize for Trae
+    const { messages, toolMap, isToolContinuation } = prepareOpenAIMessagesForTrae(rawMessages, tools, reqId);
+
+    console.log(`[openai ${reqId}] POST /v1/chat/completions model=${modelName} stream=${isStream} messages=${messages.length} function=${funcName || 'auto'} has_tools=${!!(tools && tools.length)} toolContinuation=${isToolContinuation}`);
     const completionId = `chatcmpl-${uuidv4()}`;
 
     let saveToPath = null;
@@ -847,9 +1177,13 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
 
     if (isStream) {
       res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
+      // Disable Nagle-ish buffering at HTTP layer when possible
+      if (res.socket && typeof res.socket.setNoDelay === 'function') {
+        try { res.socket.setNoDelay(true); } catch (e) {}
+      }
 
       const roleChunk = createOpenAIStreamChunk(completionId, modelName, { role: 'assistant' }, null);
       res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
@@ -864,7 +1198,8 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
           saveToPath,
           persistAssistant,
           reqId,
-          isStream: true
+          isStream: true,
+          toolMap
         });
         req.on('close', () => {
           // Best-effort: nothing else to destroy here; individual bodies are destroyed on fallback.
@@ -916,14 +1251,19 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
           saveToPath,
           persistAssistant,
           reqId,
-          isStream: false
+          isStream: false,
+          toolMap
         });
 
-        const fullContent = collected.fullContent || '';
+        let fullContent = collected.fullContent || '';
         const fullReasoning = collected.fullReasoning || '';
         const tokenUsage = collected.tokenUsage || null;
-        const finishReason = collected.finishReason || 'stop';
+        let finishReason = collected.finishReason || 'stop';
         const modelUsed = collected.modelUsed || modelName;
+        let toolCalls = applyToolMapToToolCalls(collected.toolCalls || [], toolMap);
+        if (toolCalls.length > 0 && (!finishReason || finishReason === 'stop')) {
+          finishReason = 'tool_calls';
+        }
 
         const usage = tokenUsage ? {
           prompt_tokens: tokenUsage.prompt_tokens || 0,
@@ -931,7 +1271,7 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
           total_tokens: tokenUsage.total_tokens || 0,
         } : undefined;
 
-        const response = createOpenAIChatCompletion(completionId, modelUsed, fullContent, finishReason, fullReasoning, usage);
+        const response = createOpenAIChatCompletion(completionId, modelUsed, fullContent, finishReason, fullReasoning, usage, toolCalls);
 
         if (saveToPath && fullContent) {
           try {
@@ -948,8 +1288,12 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
         }
 
         if (persistAssistant) {
-          try { persistAssistant(fullContent, fullReasoning, tokenUsage); }
+          try { persistAssistant(fullContent, fullReasoning, tokenUsage, toolCalls); }
           catch (e) { console.error('[persist] assistant (non-stream) failed:', e); }
+        }
+
+        if (toolCalls.length) {
+          console.log(`[openai ${reqId}] non-stream finish_reason=${finishReason} tools=${toolCalls.map(t => t.function.name).join(',')}`);
         }
 
         res.json(response);
@@ -1637,74 +1981,68 @@ app.post('/v1/messages', authenticate, async (req, res) => {
     }
     const isToolContinuation = hasToolResult && hasToolUse;
 
-    // If Claude Code sends tools, inject them into the conversation
-    // so the Trae model knows about available tools and uses correct tool names
+    // Compact tool inject for Anthropic clients (same protocol as OpenAI path).
+    // Avoid dumping full descriptions for 80+ tools — that bloats TTFT badly.
     let toolMap = null;  // maps lowercase tool name -> original tool name
     if (tools && Array.isArray(tools) && tools.length > 0) {
       toolMap = {};
-      const toolDescriptions = tools.map(t => {
-        const nameLower = t.name.toLowerCase();
-        toolMap[nameLower] = t.name;
-        // Map all Claude Code tool name variants
-        // File operations
+      const compactLines = [];
+      for (const t of tools) {
+        const name = t.name || t.function?.name || 'unknown';
+        const nameLower = name.toLowerCase();
+        toolMap[nameLower] = name;
         if (nameLower === 'read' || nameLower === 'read_file') {
-          toolMap['read_file'] = t.name;
-          toolMap['read'] = t.name;
+          toolMap['read_file'] = name; toolMap['read'] = name;
         }
         if (nameLower === 'write' || nameLower === 'write_file') {
-          toolMap['write_file'] = t.name;
-          toolMap['write'] = t.name;
+          toolMap['write_file'] = name; toolMap['write'] = name;
         }
         if (nameLower === 'edit' || nameLower === 'edit_file') {
-          toolMap['edit_file'] = t.name;
-          toolMap['edit'] = t.name;
+          toolMap['edit_file'] = name; toolMap['edit'] = name;
         }
         if (nameLower === 'multiedit' || nameLower === 'multi_edit') {
-          toolMap['multiedit'] = t.name;
-          toolMap['multi_edit'] = t.name;
+          toolMap['multiedit'] = name; toolMap['multi_edit'] = name;
         }
-        // Search/list operations
         if (nameLower === 'glob' || nameLower === 'listdir' || nameLower === 'list_files') {
-          toolMap['listdir'] = t.name;
-          toolMap['glob'] = t.name;
-          toolMap['list_files'] = t.name;
+          toolMap['listdir'] = name; toolMap['glob'] = name; toolMap['list_files'] = name;
         }
         if (nameLower === 'grep' || nameLower === 'search_files') {
-          toolMap['grep'] = t.name;
-          toolMap['search_files'] = t.name;
+          toolMap['grep'] = name; toolMap['search_files'] = name;
         }
-        // Command execution
         if (nameLower === 'bash' || nameLower === 'execute_command' || nameLower === 'run_command') {
-          toolMap['execute_command'] = t.name;
-          toolMap['bash'] = t.name;
-          toolMap['run_command'] = t.name;
+          toolMap['execute_command'] = name; toolMap['bash'] = name; toolMap['run_command'] = name;
         }
-        // Web operations
         if (nameLower === 'webfetch' || nameLower === 'fetch_url' || nameLower === 'web_fetch') {
-          toolMap['webfetch'] = t.name;
-          toolMap['fetch_url'] = t.name;
-          toolMap['web_fetch'] = t.name;
+          toolMap['webfetch'] = name; toolMap['fetch_url'] = name; toolMap['web_fetch'] = name;
         }
         if (nameLower === 'websearch' || nameLower === 'search_internet' || nameLower === 'web_search') {
-          toolMap['websearch'] = t.name;
-          toolMap['search_internet'] = t.name;
-          toolMap['web_search'] = t.name;
+          toolMap['websearch'] = name; toolMap['search_internet'] = name; toolMap['web_search'] = name;
         }
-        const params = t.input_schema?.properties ? Object.keys(t.input_schema.properties).join(', ') : '';
-        return `- ${t.name}(${params}): ${t.description?.substring(0, 200) || ''}`;
-      }).join('\n');
-
-      // Build tool system message with clear instructions for multi-turn tool use
-      let toolSystemMsg = `\n\n<available_tools>\nYou have access to the following tools. To call a tool, output a toolcall block in JSON format:\n<toolcall>{"name": "ToolName", "params": {"param1": "value1"}}</toolcall>\n\nCRITICAL RULES:\n- The <toolcall> block MUST contain valid JSON with "name" and "params" keys\n- Do NOT use XML attributes like: ToolName param="value"\n- Do NOT use <arg_key>/<arg_value> tags\n- Use the EXACT tool names listed below (case-sensitive)\n- Output the <toolcall> block directly in your response, not inside other tags\n\nAvailable tools:\n${toolDescriptions}\n`;
-
-      // If this is a tool continuation (tool_result was sent back), add explicit instruction
-      if (isToolContinuation) {
-        toolSystemMsg += `\nCRITICAL: You are in a multi-turn tool use conversation. The user has sent back tool results from your previous tool calls. You MUST:\n1. Analyze the tool results carefully\n2. If you need more information, call another tool using <toolcall> format\n3. If you have enough information to answer the user's question, provide your final answer as text\n4. Do NOT just say "I've completed the task" without providing the actual information or result the user requested\n5. Do NOT stop prematurely - continue working until the task is fully complete\n`;
+        const schema = t.input_schema || t.function?.parameters || {};
+        const params = schema.properties ? Object.keys(schema.properties).slice(0, 8).join(',') : '';
+        compactLines.push(params ? `${name}(${params})` : name);
       }
 
-      toolSystemMsg += `</available_tools>`;
+      let toolSystemMsg =
+        `\n\n<toolcall_protocol>\n` +
+        `When you need a tool, output ONLY this XML block (valid JSON inside):\n` +
+        `<toolcall>{"name":"ToolName","params":{"arg":"value"}}</toolcall>\n` +
+        `Rules:\n` +
+        `- JSON must have "name" and "params"\n` +
+        `- Use EXACT tool names from the list (case-sensitive)\n` +
+        `- Do not wrap toolcall in markdown fences\n` +
+        `- After tool results, continue until the user question is answered\n` +
+        `Tools (${compactLines.length}): ${compactLines.join(', ')}\n` +
+        `</toolcall_protocol>\n`;
 
-      // Inject into the first system message or prepend as system message
+      if (isToolContinuation) {
+        toolSystemMsg +=
+          `\n<tool_continuation>\n` +
+          `User returned tool results. Read them, call more tools if needed, or answer fully in plain text.\n` +
+          `Do not stop after one tool without answering.\n` +
+          `</tool_continuation>\n`;
+      }
+
       const systemMsg = openaiMessages.find(m => m.role === 'system');
       if (systemMsg) {
         systemMsg.content += toolSystemMsg;
@@ -1712,11 +2050,11 @@ app.post('/v1/messages', authenticate, async (req, res) => {
         openaiMessages.unshift({ role: 'system', content: toolSystemMsg });
       }
 
-      console.log(`[anthropic ${reqId}] Injected ${tools.length} tools into system prompt, isToolContinuation=${isToolContinuation}, toolMap: ${JSON.stringify(Object.keys(toolMap))}`);
+      console.log(`[anthropic ${reqId}] Injected ${tools.length} tools (compact, ~${toolSystemMsg.length} chars), isToolContinuation=${isToolContinuation}`);
     } else if (isToolContinuation) {
       // Tool continuation but no tools sent in this request - still need to instruct the model
       const systemMsg = openaiMessages.find(m => m.role === 'system');
-      const continuationMsg = `\n\nIMPORTANT: You are in a multi-turn tool use conversation. The user has sent back tool results. You MUST analyze the results and continue working. If you need more information, call another tool. Otherwise, provide a complete answer. Do NOT stop prematurely.`;
+      const continuationMsg = `\n\nIMPORTANT: Multi-turn tool use. Analyze tool results and continue. Call more tools if needed, otherwise give a complete answer. Do NOT stop prematurely.`;
       if (systemMsg) {
         systemMsg.content += continuationMsg;
       } else {
@@ -1767,9 +2105,13 @@ app.post('/v1/messages', authenticate, async (req, res) => {
 
     if (isStream) {
       res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
+      // Disable Nagle-ish buffering at HTTP layer when possible
+      if (res.socket && typeof res.socket.setNoDelay === 'function') {
+        try { res.socket.setNoDelay(true); } catch (e) {}
+      }
 
       const sendEvent = (eventType, data) => {
         if (res.writableEnded) return;

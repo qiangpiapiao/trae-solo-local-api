@@ -1,12 +1,17 @@
 const { v4: uuidv4 } = require('./uuid');
 
-function createOpenAIChatCompletion(id, model, content, finishReason, reasoning, usage) {
+function createOpenAIChatCompletion(id, model, content, finishReason, reasoning, usage, toolCalls) {
   const message = {
     role: 'assistant',
     content: content
   };
   if (reasoning) {
     message.reasoning_content = reasoning;
+  }
+  if (toolCalls && toolCalls.length > 0) {
+    message.tool_calls = toolCalls;
+    // OpenAI often uses null content when only tool_calls are present
+    if (!content) message.content = null;
   }
   return {
     id: id || `chatcmpl-${uuidv4()}`,
@@ -16,7 +21,7 @@ function createOpenAIChatCompletion(id, model, content, finishReason, reasoning,
     choices: [{
       index: 0,
       message: message,
-      finish_reason: finishReason || 'stop'
+      finish_reason: finishReason || (toolCalls && toolCalls.length ? 'tool_calls' : 'stop')
     }],
     usage: usage || {
       prompt_tokens: 0,
@@ -201,6 +206,26 @@ function llmUtilsChunkToOpenAI(chunk, id, model, includeReasoning) {
     if (includeReasoning && chunk.reasoning) {
       delta.reasoning_content = chunk.reasoning;
     }
+    // Native Trae tool_calls on output events
+    if (chunk.tool_calls && Array.isArray(chunk.tool_calls) && chunk.tool_calls.length > 0) {
+      delta.tool_calls = chunk.tool_calls.map((tc, i) => {
+        const name = tc.name || tc.function?.name || tc.tool_name || '';
+        const args = tc.params != null ? tc.params
+          : (tc.arguments != null ? tc.arguments
+            : (tc.input != null ? tc.input
+              : (tc.function?.arguments != null ? tc.function.arguments : {})));
+        const argsStr = typeof args === 'string' ? args : JSON.stringify(args || {});
+        return {
+          index: tc.index != null ? tc.index : i,
+          id: tc.id || `call_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
+          type: 'function',
+          function: {
+            name,
+            arguments: argsStr
+          }
+        };
+      });
+    }
     if (Object.keys(delta).length === 0) return null;
     return createOpenAIStreamChunk(id, model, delta, null);
   }
@@ -212,6 +237,256 @@ function llmUtilsChunkToOpenAI(chunk, id, model, includeReasoning) {
   }
 
   return null;
+}
+
+/**
+ * Extract <toolcall>...</toolcall> / <tool_call>...</tool_call> blocks from assistant text.
+ * Also supports fenced blocks: ```tool_call ... ``` / ```json tool ... ```
+ * Returns { text, toolCalls } where text has toolcall tags removed.
+ */
+function extractToolcallsFromText(text, parseToolcallContent) {
+  if (!text || typeof text !== 'string') {
+    return { text: text || '', toolCalls: [] };
+  }
+  let cleaned = text;
+  const toolCalls = [];
+
+  const pushParsed = (inner) => {
+    try {
+      const parsed = typeof parseToolcallContent === 'function'
+        ? parseToolcallContent(inner)
+        : JSON.parse(String(inner).trim());
+      const name = parsed.name || parsed.tool || parsed.tool_name || '';
+      let finalParams = parsed.params != null ? parsed.params
+        : (parsed.arguments != null ? parsed.arguments
+          : (parsed.input != null ? parsed.input : parsed));
+      if (finalParams && typeof finalParams === 'object' && finalParams.name && finalParams === parsed) {
+        const { name: _n, tool: _t, tool_name: _tn, ...rest } = finalParams;
+        finalParams = rest;
+      }
+      if (!name) return false;
+      toolCalls.push({
+        id: `call_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
+        type: 'function',
+        function: {
+          name: String(name),
+          arguments: typeof finalParams === 'string' ? finalParams : JSON.stringify(finalParams || {})
+        }
+      });
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  // 1) XML-style toolcall / tool_call tags
+  const re = /<(?:tool_call|toolcall)(?:\s[^>]*)?>([\s\S]*?)<\/(?:tool_call|toolcall)>/gi;
+  const matches = [];
+  let match;
+  re.lastIndex = 0;
+  while ((match = re.exec(text)) !== null) {
+    matches.push({ full: match[0], inner: match[1] });
+  }
+  for (const m of matches) {
+    cleaned = cleaned.replace(m.full, '');
+    if (!pushParsed(m.inner)) {
+      cleaned += '\n[unparsed toolcall]\n';
+    }
+  }
+
+  // 2) Fenced blocks used by some models: ```tool_call\n{...}\n```
+  const fenceRe = /```(?:tool_call|toolcall|json)\s*\n([\s\S]*?)```/gi;
+  const fences = [];
+  while ((match = fenceRe.exec(cleaned)) !== null) {
+    const inner = match[1].trim();
+    if (/["']name["']\s*:/.test(inner) || /["']tool["']\s*:/.test(inner)) {
+      fences.push({ full: match[0], inner });
+    }
+  }
+  for (const f of fences) {
+    if (pushParsed(f.inner)) cleaned = cleaned.replace(f.full, '');
+  }
+
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+  return { text: cleaned, toolCalls };
+}
+
+/**
+ * Streaming toolcall detector: feed text deltas, get { emitText, finishedToolCalls }.
+ * Buffers partial <toolcall> tags so we don't leak incomplete tags to the client.
+ */
+function createOpenAIToolcallStreamFilter(parseToolcallContent) {
+  const state = {
+    buffer: '',
+    inToolCall: false,
+    finishedToolCalls: [],
+    toolCallIndex: 0
+  };
+
+  function tryParseInner(inner) {
+    try {
+      const parsed = typeof parseToolcallContent === 'function'
+        ? parseToolcallContent(inner)
+        : JSON.parse(String(inner).trim());
+      const name = parsed.name || parsed.tool || parsed.tool_name || '';
+      let params = parsed.params != null ? parsed.params
+        : (parsed.arguments != null ? parsed.arguments
+          : (parsed.input != null ? parsed.input : parsed));
+      if (params && typeof params === 'object' && params.name && params === parsed) {
+        const { name: _n, tool: _t, tool_name: _tn, ...rest } = params;
+        params = rest;
+      }
+      if (!name) return null;
+      const tc = {
+        index: state.toolCallIndex++,
+        id: `call_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
+        type: 'function',
+        function: {
+          name: String(name),
+          arguments: typeof params === 'string' ? params : JSON.stringify(params || {})
+        }
+      };
+      state.finishedToolCalls.push(tc);
+      return tc;
+    } catch (e) {
+      console.error(`[openai-format] toolcall parse fail: ${e.message}`);
+      return null;
+    }
+  }
+
+  function feed(textChunk) {
+    if (!textChunk) return { emitText: '', finishedToolCalls: [] };
+    state.buffer += textChunk;
+    let emitText = '';
+    const finished = [];
+
+    while (state.buffer.length > 0) {
+      if (state.inToolCall) {
+        let closeIdx = state.buffer.toLowerCase().indexOf('</toolcall>');
+        let closeLen = '</toolcall>'.length;
+        let closeToken = '</toolcall>';
+        const alt = state.buffer.toLowerCase().indexOf('</tool_call>');
+        if (closeIdx < 0 || (alt >= 0 && alt < closeIdx)) {
+          if (alt >= 0) {
+            closeIdx = alt;
+            closeLen = '</tool_call>'.length;
+            closeToken = '</tool_call>';
+          }
+        }
+        // find actual case-sensitive slice length from buffer
+        if (closeIdx >= 0) {
+          // re-find with original case using regex
+          const cm = state.buffer.match(/<\/(?:tool_call|toolcall)>/i);
+          if (cm && cm.index != null) {
+            closeIdx = cm.index;
+            closeLen = cm[0].length;
+          }
+        }
+        if (closeIdx < 0) {
+          // still open — wait for more, avoid unbounded buffer
+          if (state.buffer.length > 200000) {
+            emitText += state.buffer;
+            state.buffer = '';
+            state.inToolCall = false;
+          }
+          break;
+        }
+        const full = state.buffer.slice(0, closeIdx + closeLen);
+        const openMatch = full.match(/<(?:tool_call|toolcall)(?:\s[^>]*)?>/i);
+        const inner = openMatch
+          ? full.slice(openMatch[0].length, full.length - closeLen)
+          : full;
+        state.buffer = state.buffer.slice(closeIdx + closeLen);
+        state.inToolCall = false;
+        const tc = tryParseInner(inner);
+        if (tc) finished.push(tc);
+      } else {
+        // look for start tag
+        const m = state.buffer.match(/<(?:tool_call|toolcall)(?:\s[^>]*)?>/i);
+        if (m && m.index != null) {
+          emitText += state.buffer.slice(0, m.index);
+          state.buffer = state.buffer.slice(m.index);
+          state.inToolCall = true;
+          continue;
+        }
+        // partial tag at end?
+        const lt = state.buffer.lastIndexOf('<');
+        if (lt >= 0) {
+          const tail = state.buffer.slice(lt).toLowerCase();
+          const maybe = '<toolcall>'.startsWith(tail) || '<tool_call>'.startsWith(tail)
+            || '<toolcall '.startsWith(tail) || '<tool_call '.startsWith(tail)
+            || tail.startsWith('<toolcall') || tail.startsWith('<tool_call');
+          if (maybe) {
+            emitText += state.buffer.slice(0, lt);
+            state.buffer = state.buffer.slice(lt);
+            break;
+          }
+        }
+        emitText += state.buffer;
+        state.buffer = '';
+        break;
+      }
+    }
+    return { emitText, finishedToolCalls: finished };
+  }
+
+  function flush() {
+    // If stream ends mid-toolcall, try hard to salvage complete JSON inside buffer
+    if (state.inToolCall && state.buffer) {
+      const openMatch = state.buffer.match(/<(?:tool_call|toolcall)(?:\s[^>]*)?>/i);
+      const inner = openMatch ? state.buffer.slice(openMatch[0].length) : state.buffer;
+      // try parse if looks like complete/near-complete JSON
+      const jsonMatch = inner.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const tc = tryParseInner(jsonMatch[0]);
+        state.buffer = '';
+        state.inToolCall = false;
+        return { emitText: '', finishedToolCalls: tc ? [tc] : [] };
+      }
+      // drop incomplete tag — better than leaking raw XML to client as text
+      console.warn('[openai-format] dropping incomplete toolcall buffer at stream end');
+      state.buffer = '';
+      state.inToolCall = false;
+      return { emitText: '', finishedToolCalls: [] };
+    }
+    const leftover = state.buffer;
+    state.buffer = '';
+    state.inToolCall = false;
+    return { emitText: leftover, finishedToolCalls: [] };
+  }
+
+  return { feed, flush, state };
+}
+
+/**
+ * Build OpenAI-compatible streaming deltas for a completed tool call.
+ * Phase 1: id + type + name (arguments empty)
+ * Phase 2: full arguments
+ * Stricter clients (some agent SDKs) require the two-phase shape.
+ */
+function buildOpenAIToolCallStreamDeltas(tc) {
+  const index = tc.index != null ? tc.index : 0;
+  const id = tc.id || `call_${uuidv4().replace(/-/g, '').slice(0, 24)}`;
+  const name = tc.function?.name || '';
+  const args = tc.function?.arguments != null
+    ? (typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments))
+    : '{}';
+  return [
+    {
+      tool_calls: [{
+        index,
+        id,
+        type: 'function',
+        function: { name, arguments: '' }
+      }]
+    },
+    {
+      tool_calls: [{
+        index,
+        function: { arguments: args }
+      }]
+    }
+  ];
 }
 
 function parseTraeStreamChunk(rawLine) {
@@ -379,5 +654,8 @@ module.exports = {
   parseTraeStreamChunk,
   parseAgentTaskStream,
   normalizeAgentTaskChunk,
-  traeChunkToOpenAI
+  traeChunkToOpenAI,
+  extractToolcallsFromText,
+  createOpenAIToolcallStreamFilter,
+  buildOpenAIToolCallStreamDeltas
 };
