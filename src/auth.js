@@ -5,22 +5,61 @@ const fetch = require('node-fetch');
 const { v4: uuidv4 } = require('./uuid');
 const { decryptAuthData: decryptTcAuthData, isTcEncrypted } = require('./trae-decrypt');
 
+// Prefer APPDATA (may be redirected, e.g. D:\AppData\Roaming) over homedir\AppData\Roaming.
+function getRoamingRoot() {
+  return process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+}
+
+// Candidate product folders per edition. First existing storage.json wins for that edition.
+const CN_PRODUCT_DIRS = ['TRAE SOLO CN', 'Trae CN', 'TRAE CN'];
+const SG_PRODUCT_DIRS = ['TRAE SOLO', 'Trae', 'TRAE'];
+
+function resolveProductDataDir(edition) {
+  if (process.env.TRAE_DATA_DIR) return process.env.TRAE_DATA_DIR;
+  const root = getRoamingRoot();
+  const names = edition === 'cn' ? CN_PRODUCT_DIRS : SG_PRODUCT_DIRS;
+  let best = null;
+  let bestMtime = -1;
+  for (const name of names) {
+    const dir = path.join(root, name);
+    const storagePath = path.join(dir, 'User', 'globalStorage', 'storage.json');
+    if (!fs.existsSync(storagePath)) continue;
+    try {
+      const mtime = fs.statSync(storagePath).mtimeMs;
+      if (mtime > bestMtime) {
+        bestMtime = mtime;
+        best = dir;
+      }
+    } catch (e) {
+      if (!best) best = dir;
+    }
+  }
+  // Fallback to conventional Trae / Trae CN even if missing (error later).
+  if (!best) {
+    best = path.join(root, edition === 'cn' ? 'Trae CN' : 'Trae');
+  }
+  return best;
+}
+
 function getTraeDataDir() {
   const envDir = process.env.TRAE_DATA_DIR;
   if (envDir) return envDir;
-  const edition = detectEdition();
-  if (edition === 'cn') {
-    return path.join(os.homedir(), 'AppData', 'Roaming', 'Trae CN');
-  }
-  return path.join(os.homedir(), 'AppData', 'Roaming', 'Trae');
+  return resolveProductDataDir(detectEdition());
 }
 
 function detectEdition() {
   const envEdition = process.env.TRAE_EDITION;
-  if (envEdition) return envEdition.toLowerCase();
+  if (envEdition) {
+    const e = envEdition.toLowerCase();
+    // solo-cn / solo_cn treat as cn crypto + CN API hosts
+    if (e === 'solo' || e === 'solo-cn' || e === 'solo_cn' || e === 'cn') return 'cn';
+    return e;
+  }
 
-  const cnPath = path.join(os.homedir(), 'AppData', 'Roaming', 'Trae CN', 'User', 'globalStorage', 'storage.json');
-  const sgPath = path.join(os.homedir(), 'AppData', 'Roaming', 'Trae', 'User', 'globalStorage', 'storage.json');
+  const cnDir = resolveProductDataDir('cn');
+  const sgDir = resolveProductDataDir('sg');
+  const cnPath = path.join(cnDir, 'User', 'globalStorage', 'storage.json');
+  const sgPath = path.join(sgDir, 'User', 'globalStorage', 'storage.json');
 
   const cnExists = fs.existsSync(cnPath);
   const sgExists = fs.existsSync(sgPath);
@@ -41,9 +80,7 @@ function detectEdition() {
 
 function getStorageJsonPath(edition) {
   const ed = edition || detectEdition();
-  const dataDir = ed === 'cn'
-    ? path.join(os.homedir(), 'AppData', 'Roaming', 'Trae CN')
-    : path.join(os.homedir(), 'AppData', 'Roaming', 'Trae');
+  const dataDir = resolveProductDataDir(ed);
   return path.join(dataDir, 'User', 'globalStorage', 'storage.json');
 }
 
@@ -64,9 +101,7 @@ function isEncryptedAuthData(raw) {
 }
 
 function readStorageJsonByEdition(edition) {
-  const dataDir = edition === 'cn'
-    ? path.join(os.homedir(), 'AppData', 'Roaming', 'Trae CN')
-    : path.join(os.homedir(), 'AppData', 'Roaming', 'Trae');
+  const dataDir = resolveProductDataDir(edition);
   const storagePath = path.join(dataDir, 'User', 'globalStorage', 'storage.json');
   if (!fs.existsSync(storagePath)) return null;
   const raw = fs.readFileSync(storagePath, 'utf-8');
@@ -85,13 +120,11 @@ function getAuthInfo() {
 
   for (const ed of editions) {
     try {
-      const dataDir = ed === 'cn'
-        ? path.join(os.homedir(), 'AppData', 'Roaming', 'Trae CN')
-        : path.join(os.homedir(), 'AppData', 'Roaming', 'Trae');
+      const dataDir = resolveProductDataDir(ed);
 
       try {
         const auth = decryptTcAuthData(dataDir);
-        console.log(`[auth] Using ${ed.toUpperCase()} edition auth data (decrypted)`);
+        console.log(`[auth] Using ${ed.toUpperCase()} edition auth data from ${dataDir} (decrypted)`);
         _cachedAuthInfo = {
           token: auth.token,
           refreshToken: auth.refreshToken,
@@ -393,22 +426,43 @@ async function refreshTokenIfNeeded() {
   return _refreshPromise;
 }
 
+function findManifestPaths() {
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  const candidates = [
+    process.env.TRAE_INSTALL_DIR,
+    path.join('D:', 'software', 'TRAE SOLO CN'),
+    path.join('E:', 'software', 'Trae CN'),
+    path.join(localAppData, 'Programs', 'TRAE SOLO CN'),
+    path.join(localAppData, 'Programs', 'Trae CN'),
+    path.join(localAppData, 'Programs', 'Trae-CN'),
+    path.join(localAppData, 'Programs', 'TRAE SOLO'),
+    path.join(localAppData, 'Programs', 'Trae'),
+  ].filter(Boolean);
+  return candidates.map((dir) => path.join(dir, 'manifest.json'));
+}
+
+function readManifest() {
+  for (const manifestPath of findManifestPaths()) {
+    try {
+      if (!fs.existsSync(manifestPath)) continue;
+      return JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+    } catch (e) {}
+  }
+  return null;
+}
+
 function getIdeVersion() {
   // Explicit env override takes highest priority
   if (process.env.TRAE_IDE_VERSION) return process.env.TRAE_IDE_VERSION;
 
-  // Try to read from Trae's manifest.json for accurate version
+  // SOLO real traffic uses appVersion (e.g. 0.1.38), NOT tron buildVersion.
   try {
-    const edition = detectEdition();
-    const baseDir = edition === 'cn'
-      ? path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Trae-CN')
-      : path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Trae');
-    const manifestPath = path.join(baseDir, 'manifest.json');
-    if (fs.existsSync(manifestPath)) {
-      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-      if (manifest.appVersion) {
-        return manifest.appVersion;
-      }
+    const manifest = readManifest();
+    if (manifest) {
+      if (isSoloProduct() && manifest.appVersion) return String(manifest.appVersion);
+      // Classic Trae CN often uses appVersion too in headers; prefer appVersion then buildVersion
+      if (manifest.appVersion) return String(manifest.appVersion);
+      if (manifest.buildVersion) return String(manifest.buildVersion);
     }
   } catch (e) {
     // Fall through to defaults
@@ -416,15 +470,46 @@ function getIdeVersion() {
 
   try {
     const authInfo = getAuthInfo();
-    if (authInfo._edition === 'cn') return DEFAULT_IDE_VERSION_CN;
+    if (authInfo._edition === 'cn') return isSoloProduct() ? '0.1.38' : DEFAULT_IDE_VERSION_CN;
     return DEFAULT_IDE_VERSION_SG;
   } catch (e) {
-    return DEFAULT_IDE_VERSION_CN;
+    return isSoloProduct() ? '0.1.38' : DEFAULT_IDE_VERSION_CN;
   }
 }
 
 function getIdeVersionCode() {
-  return process.env.TRAE_IDE_VERSION_CODE || DEFAULT_IDE_VERSION_CODE;
+  if (process.env.TRAE_IDE_VERSION_CODE) return process.env.TRAE_IDE_VERSION_CODE;
+  // SOLO observed code like 20260716 (date-based). Prefer env; else derive from today for solo.
+  if (isSoloProduct()) {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}${m}${day}`;
+  }
+  return DEFAULT_IDE_VERSION_CODE;
+}
+
+// SOLO stores real aha device id in storage key: iCubeAuthInfo://icube-dc:<deviceId>
+function extractSoloDeviceId(storage) {
+  if (!storage || typeof storage !== 'object') return '';
+  for (const key of Object.keys(storage)) {
+    const m = /^iCubeAuthInfo:\/\/icube-dc:(\d+)$/.exec(key);
+    if (m) return m[1];
+  }
+  return '';
+}
+
+function isSoloProduct() {
+  if (process.env.TRAE_PRODUCT) {
+    return String(process.env.TRAE_PRODUCT).toLowerCase().includes('solo');
+  }
+  try {
+    const dataDir = getTraeDataDir();
+    return /solo/i.test(dataDir || '');
+  } catch (e) {
+    return false;
+  }
 }
 
 function getDeviceInfo() {
@@ -433,20 +518,30 @@ function getDeviceInfo() {
   const machineId = storage['telemetry.machineId'] || '';
   const sqmId = storage['telemetry.sqmId'] || '';
   const devDeviceId = storage['telemetry.devDeviceId'] || '';
+  const soloDeviceId = extractSoloDeviceId(storage);
+  // SOLO real traffic uses aha device id (digits), not hash(machineId).
+  const deviceId = process.env.TRAE_DEVICE_ID
+    || soloDeviceId
+    || hashDeviceId(machineId)
+    || '';
   return {
     cpu: process.env.TRAE_CPU || 'Intel',
-    device_id: hashDeviceId(machineId) || process.env.TRAE_DEVICE_ID || '',
+    device_id: deviceId,
     machine_id: machineId || process.env.TRAE_MACHINE_ID || '',
-    device_model: process.env.TRAE_DEVICE_MODEL || '82RF',
+    device_model: process.env.TRAE_DEVICE_MODEL || (isSoloProduct() ? '83DG' : '82RF'),
     os_name: process.env.TRAE_OS_NAME || 'windows',
-    os_version: process.env.TRAE_OS_VERSION || 'Windows 10'
+    os_version: process.env.TRAE_OS_VERSION || (isSoloProduct() ? 'Windows 11 Pro' : 'Windows 10'),
+    sqm_id: sqmId,
+    dev_device_id: devDeviceId,
+    is_solo: isSoloProduct()
   };
 }
 
 function buildCommonHeaders(authInfo, deviceIds) {
   const deviceInfo = getDeviceInfo();
   const traceId = uuidv4().replace(/-/g, '');
-  return {
+  const spanId = uuidv4().replace(/-/g, '').slice(0, 16);
+  const headers = {
     'Content-Type': 'application/json',
     'Authorization': `Cloud-IDE-JWT ${authInfo.token}`,
     'X-Cloudide-Token': authInfo.token,
@@ -455,6 +550,8 @@ function buildCommonHeaders(authInfo, deviceIds) {
     'x-ide-version-code': getIdeVersionCode(),
     'x-app-version-code': getIdeVersionCode(),
     'x-custom-trace-id': traceId,
+    // SOLO also sends W3C traceparent-like header
+    'x-flow-traceparent': `04-${traceId}-${spanId}-01`,
     'x-device-brand': deviceInfo.device_model,
     'x-device-cpu': deviceInfo.cpu,
     'x-device-id': deviceInfo.device_id,
@@ -466,6 +563,7 @@ function buildCommonHeaders(authInfo, deviceIds) {
     'request-traffic-type': 'prod',
     'x-uid': authInfo.userId || ''
   };
+  return headers;
 }
 
 function buildStreamHeaders(authInfo, deviceIds, requestId, lastEventId) {
@@ -508,5 +606,7 @@ module.exports = {
   buildCommonHeaders,
   buildStreamHeaders,
   hashDeviceId,
-  detectEdition
+  detectEdition,
+  isSoloProduct,
+  extractSoloDeviceId
 };

@@ -148,7 +148,7 @@ app.get('/v1/models', authenticate, (req, res) => {
   res.json(createOpenAIModels([...models, ...functions]));
 });
 
-function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveToPath, logId, onComplete) {
+function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveToPath, logId, onComplete, streamControl) {
   let buffer = '';
   let currentEventName = '';
   let fullContent = '';
@@ -156,6 +156,9 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
   let tokenUsage = null;
   let llmFinalized = false;
   let persisted = false;
+  let abortedForFallback = false;
+  let lastQueuePosition = 0;
+  const control = streamControl || null;
 
   const finalizeLlmLog = () => {
     if (llmFinalized) return;
@@ -170,13 +173,75 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
     catch (e) { console.error('[persist] onComplete error:', e); }
   };
 
+  const destroyBody = () => {
+    try { if (responseBody && responseBody.destroy) responseBody.destroy(); } catch (e) {}
+  };
+
+  const decideFallback = (position) => {
+    if (!control || control.fallbackResolved) return null;
+    const fbConfig = getFallbackConfig() || {};
+    if (!fbConfig.autoFallback || !(position > (fbConfig.queueThreshold || 300))) return null;
+
+    const attempted = control.fallbackAttempted || {};
+    let currentConfig = control.currentConfig;
+    if (!currentConfig || currentConfig === 'auto') {
+      currentConfig = resolveModelId(control.originalModel || modelName);
+    }
+
+    if (isTieredFallbackEnabled()) {
+      if (isRaceWithinTierEnabled()) {
+        const sameTier = getSameTierModels(currentConfig).filter(m => !attempted[m]);
+        if (sameTier.length > 0) {
+          for (const m of sameTier) attempted[m] = true;
+          console.log(`[openai-fallback] Queue #${position} > threshold, RACE within tier: ${sameTier.join(', ')}`);
+          return { raceModels: sameTier };
+        }
+      }
+      const nextModels = getNextTierModels(currentConfig, Object.keys(attempted));
+      if (nextModels.length > 0) {
+        const nextModel = nextModels[0];
+        attempted[nextModel] = true;
+        console.log(`[openai-fallback] Queue #${position} > threshold, falling back to next tier: ${nextModel}`);
+        return { nextModel };
+      }
+      const fbModel = getFallbackModel();
+      if (fbModel && !attempted[fbModel]) {
+        attempted[fbModel] = true;
+        console.log(`[openai-fallback] All tiers exhausted, using fallback model: ${fbModel}`);
+        return { nextModel: fbModel };
+      }
+    } else {
+      const fallbackChain = getFallbackChain(control.originalModel || modelName);
+      const nextModel = fallbackChain.find(m => !attempted[m]);
+      if (nextModel) {
+        attempted[nextModel] = true;
+        console.log(`[openai-fallback] Queue #${position} > threshold, falling back to ${nextModel}`);
+        return { nextModel };
+      }
+    }
+    return null;
+  };
+
+  const triggerFallback = (decision) => {
+    if (!control || control.fallbackResolved || !decision) return;
+    control.fallbackResolved = true;
+    abortedForFallback = true;
+    destroyBody();
+    finalizeLlmLog();
+    if (typeof control.onFallback === 'function') {
+      control.onFallback(decision);
+    }
+  };
+
   responseBody.on('data', (chunk) => {
+    if (abortedForFallback || (control && control.fallbackResolved)) return;
     try {
       buffer += chunk.toString();
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
       for (const line of lines) {
+        if (abortedForFallback) return;
         const trimmed = line.trim();
         if (!trimmed) continue;
 
@@ -191,6 +256,23 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
 
         if (logId) trafficLogger.logResponseChunk(logId, currentEventName, parsed);
 
+        if (parsed.type === 'queue_wait' && parsed.position > 0) {
+          if (parsed.position !== lastQueuePosition) {
+            lastQueuePosition = parsed.position;
+            const decision = decideFallback(parsed.position);
+            if (decision) {
+              triggerFallback(decision);
+              return;
+            }
+          }
+          // Keep connection alive during short queues; do not emit queue text into content.
+          continue;
+        }
+
+        if (parsed.type === 'queue_begin' || parsed.type === 'queue_end') {
+          continue;
+        }
+
         if (parsed.type === 'token_usage') {
           tokenUsage = parsed.data;
           if (logId) trafficLogger.logTokenUsage(logId, tokenUsage);
@@ -198,12 +280,6 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
         }
 
         if (parsed.type === 'done') {
-          const usage = tokenUsage ? {
-            prompt_tokens: tokenUsage.prompt_tokens || 0,
-            completion_tokens: tokenUsage.completion_tokens || 0,
-            total_tokens: tokenUsage.total_tokens || 0,
-          } : undefined;
-
           if (saveToPath && fullContent) {
             try {
               const dir = path.dirname(saveToPath);
@@ -237,6 +313,7 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
           }
 
           if (logId) trafficLogger.finalizeLog(logId, { fullContent, fullReasoning, tokenUsage });
+          if (control && typeof control.onComplete === 'function') control.onComplete();
           return;
         }
 
@@ -254,6 +331,7 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
         }
       }
     } catch (err) {
+      if (abortedForFallback) return;
       console.error('[stream] Error in data callback:', err);
       if (logId) trafficLogger.logError(logId, err);
       try { responseBody.destroy(); } catch (e) {}
@@ -269,6 +347,7 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
   });
 
   responseBody.on('end', () => {
+    if (abortedForFallback) return;
     if (!res.writableEnded) {
       const doneChunk = createOpenAIStreamChunk(completionId, modelName, {}, 'stop');
       res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
@@ -276,13 +355,16 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
       res.end();
     }
     finalizeLlmLog();
+    if (control && typeof control.onComplete === 'function') control.onComplete();
   });
 
   responseBody.on('close', () => {
+    if (abortedForFallback) return;
     finalizeLlmLog();
   });
 
   responseBody.on('error', (err) => {
+    if (abortedForFallback) return;
     console.error('[stream] error:', err);
     if (logId) trafficLogger.logError(logId, err);
     finalizeLlmLog();
@@ -291,6 +373,321 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
       res.write(`data: ${JSON.stringify(errChunk)}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
+    }
+  });
+}
+
+// OpenAI path queue-aware runner (mirrors Anthropic fallback behavior).
+async function runOpenAIChatWithFallback({
+  messages, modelName, options, res, completionId, saveToPath, persistAssistant, reqId, isStream
+}) {
+  const fallbackAttempted = {};
+  let activeModel = modelName;
+  let activeConfig = (modelName && modelName !== 'auto') ? resolveModelId(modelName) : 'auto';
+
+  const collectNonStream = async (targetModel, configNameOverride) => {
+    const callOpts = { ...options };
+    if (configNameOverride) callOpts.config_name = configNameOverride;
+    const result = await llmUtilsChat(messages, targetModel, true, callOpts);
+    let fullContent = '';
+    let fullReasoning = '';
+    let tokenUsage = null;
+    let finishReason = 'stop';
+    let lastQueuePosition = 0;
+    let fallbackDecision = null;
+    const upstreamLogId = result.logId;
+
+    if (!result.body) {
+      return { fullContent, fullReasoning, tokenUsage, finishReason, fallbackDecision: null };
+    }
+
+    await new Promise((resolve, reject) => {
+      let buffer = '';
+      let currentEventName = '';
+      let settled = false;
+
+      const settle = (fn) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
+
+      const maybeFallback = (position) => {
+        const fbConfig = getFallbackConfig() || {};
+        if (!fbConfig.autoFallback || !(position > (fbConfig.queueThreshold || 300))) return null;
+        if (isTieredFallbackEnabled()) {
+          if (isRaceWithinTierEnabled()) {
+            const sameTier = getSameTierModels(activeConfig).filter(m => !fallbackAttempted[m]);
+            if (sameTier.length > 0) {
+              for (const m of sameTier) fallbackAttempted[m] = true;
+              console.log(`[openai-fallback] Queue #${position} > threshold, RACE within tier: ${sameTier.join(', ')}`);
+              return { raceModels: sameTier };
+            }
+          }
+          const nextModels = getNextTierModels(activeConfig, Object.keys(fallbackAttempted));
+          if (nextModels.length > 0) {
+            const nextModel = nextModels[0];
+            fallbackAttempted[nextModel] = true;
+            console.log(`[openai-fallback] Queue #${position} > threshold, falling back to next tier: ${nextModel}`);
+            return { nextModel };
+          }
+          const fbModel = getFallbackModel();
+          if (fbModel && !fallbackAttempted[fbModel]) {
+            fallbackAttempted[fbModel] = true;
+            console.log(`[openai-fallback] All tiers exhausted, using fallback model: ${fbModel}`);
+            return { nextModel: fbModel };
+          }
+        } else {
+          const chain = getFallbackChain(modelName);
+          const nextModel = chain.find(m => !fallbackAttempted[m]);
+          if (nextModel) {
+            fallbackAttempted[nextModel] = true;
+            console.log(`[openai-fallback] Queue #${position} > threshold, falling back to ${nextModel}`);
+            return { nextModel };
+          }
+        }
+        return null;
+      };
+
+      result.body.on('data', (chunk) => {
+        if (settled) return;
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const parsed = parseLlmUtilsChatStream(trimmed, currentEventName);
+          if (!parsed) continue;
+          if (parsed._type === 'event_name') {
+            currentEventName = parsed.value;
+            if (upstreamLogId) trafficLogger.logResponseChunk(upstreamLogId, currentEventName, null);
+            continue;
+          }
+          if (upstreamLogId) trafficLogger.logResponseChunk(upstreamLogId, currentEventName, parsed);
+
+          if (parsed.type === 'queue_wait' && parsed.position > 0) {
+            if (parsed.position !== lastQueuePosition) {
+              lastQueuePosition = parsed.position;
+              const decision = maybeFallback(parsed.position);
+              if (decision) {
+                fallbackDecision = decision;
+                try { result.body.destroy(); } catch (e) {}
+                settle(resolve);
+                return;
+              }
+            }
+            continue;
+          }
+          if (parsed.type === 'token_usage') {
+            tokenUsage = parsed.data;
+            if (upstreamLogId) trafficLogger.logTokenUsage(upstreamLogId, tokenUsage);
+            continue;
+          }
+          if (parsed.type === 'done') {
+            finishReason = parsed.finish_reason || 'stop';
+            continue;
+          }
+          if (parsed.type === 'text' && parsed.content) {
+            fullContent += parsed.content;
+            if (upstreamLogId) trafficLogger.logResponseContent(upstreamLogId, parsed.content, null);
+          }
+          if (parsed.type === 'text' && parsed.reasoning) {
+            fullReasoning += parsed.reasoning;
+            if (upstreamLogId) trafficLogger.logResponseContent(upstreamLogId, null, parsed.reasoning);
+          }
+        }
+      });
+      result.body.on('end', () => settle(resolve));
+      result.body.on('error', (err) => {
+        if (fallbackDecision) settle(resolve);
+        else settle(() => reject(err));
+      });
+    });
+
+    if (upstreamLogId) trafficLogger.finalizeLog(upstreamLogId, { fullContent, fullReasoning, tokenUsage });
+    return { fullContent, fullReasoning, tokenUsage, finishReason, fallbackDecision };
+  };
+
+  // Non-stream: loop with fallback until content or no more fallbacks.
+  if (!isStream) {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const collected = await collectNonStream(activeModel, activeConfig === 'auto' ? null : activeConfig);
+      if (collected.fallbackDecision) {
+        if (collected.fallbackDecision.raceModels && collected.fallbackDecision.raceModels.length) {
+          // Try race models sequentially for non-stream (simpler, still effective).
+          let raceHit = false;
+          for (const raceModel of collected.fallbackDecision.raceModels) {
+            activeModel = raceModel;
+            activeConfig = raceModel;
+            const raceCollected = await collectNonStream(raceModel, raceModel);
+            if (!raceCollected.fallbackDecision && (raceCollected.fullContent || raceCollected.fullReasoning)) {
+              return { ...raceCollected, modelUsed: raceModel };
+            }
+            if (!raceCollected.fallbackDecision) {
+              // finished with empty content; still return
+              return { ...raceCollected, modelUsed: raceModel };
+            }
+            raceHit = true;
+          }
+          if (raceHit) {
+            // all race models queued — drop to next tier below original
+            const nextModels = getNextTierModels(resolveModelId(modelName), Object.keys(fallbackAttempted));
+            if (nextModels.length) {
+              activeModel = nextModels[0];
+              activeConfig = nextModels[0];
+              fallbackAttempted[activeModel] = true;
+              continue;
+            }
+            const fbModel = getFallbackModel();
+            if (fbModel && !fallbackAttempted[fbModel]) {
+              activeModel = fbModel;
+              activeConfig = fbModel;
+              fallbackAttempted[fbModel] = true;
+              continue;
+            }
+          }
+          // give up racing; return empty-ish with last attempt
+          return { ...collected, modelUsed: activeModel };
+        }
+        if (collected.fallbackDecision.nextModel) {
+          activeModel = collected.fallbackDecision.nextModel;
+          activeConfig = collected.fallbackDecision.nextModel;
+          console.log(`[openai ${reqId}] Retrying non-stream with fallback model: ${activeModel}`);
+          continue;
+        }
+      }
+      return { ...collected, modelUsed: activeModel };
+    }
+    return { fullContent: '', fullReasoning: '', tokenUsage: null, finishReason: 'stop', modelUsed: activeModel };
+  }
+
+  // Stream path with fallback.
+  return await new Promise(async (resolveOuter, rejectOuter) => {
+    let settled = false;
+    const settle = (v) => {
+      if (settled) return;
+      settled = true;
+      resolveOuter(v);
+    };
+
+    const startOne = async (targetModel, configNameOverride) => {
+      if (res.writableEnded) return settle({ modelUsed: targetModel });
+      const callOpts = { ...options };
+      if (configNameOverride) callOpts.config_name = configNameOverride;
+      let result;
+      try {
+        result = await llmUtilsChat(messages, targetModel, true, callOpts);
+      } catch (err) {
+        return rejectOuter(err);
+      }
+      if (!result.body) {
+        if (!res.writableEnded) {
+          const doneChunk = createOpenAIStreamChunk(completionId, targetModel, {}, 'stop');
+          res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }
+        return settle({ modelUsed: targetModel });
+      }
+
+      const control = {
+        originalModel: modelName,
+        currentConfig: configNameOverride || resolveModelId(targetModel),
+        fallbackAttempted,
+        fallbackResolved: false,
+        onComplete: () => settle({ modelUsed: targetModel }),
+        onFallback: async (decision) => {
+          try {
+            if (decision.raceModels && decision.raceModels.length) {
+              console.log(`[openai ${reqId}] Launching TIER RACE: ${decision.raceModels.join(', ')}`);
+              // Sequential race for stream to avoid interleaving multiple bodies into one response.
+              for (const raceModel of decision.raceModels) {
+                activeModel = raceModel;
+                activeConfig = raceModel;
+                // Try one race model; if it also falls back, continue.
+                let raceFellBack = false;
+                await new Promise((resolveRace) => {
+                  llmUtilsChat(messages, raceModel, true, { ...options, config_name: raceModel }).then((raceResult) => {
+                    if (!raceResult.body) {
+                      resolveRace();
+                      return;
+                    }
+                    const raceControl = {
+                      originalModel: modelName,
+                      currentConfig: raceModel,
+                      fallbackAttempted,
+                      fallbackResolved: false,
+                      onComplete: () => resolveRace(),
+                      onFallback: () => {
+                        raceFellBack = true;
+                        resolveRace();
+                      }
+                    };
+                    handleLlmUtilsStream(raceResult.body, res, completionId, raceModel, saveToPath, raceResult.logId, persistAssistant, raceControl);
+                    reqOnCloseDestroy(raceResult.body);
+                  }).catch((e) => {
+                    console.error(`[openai ${reqId}] race model ${raceModel} failed:`, e.message);
+                    resolveRace();
+                  });
+                });
+                if (!raceFellBack) {
+                  return settle({ modelUsed: raceModel });
+                }
+              }
+              // All race models queued — try next tier / fallback model.
+              const nextModels = getNextTierModels(resolveModelId(modelName), Object.keys(fallbackAttempted));
+              if (nextModels.length) {
+                activeModel = nextModels[0];
+                activeConfig = nextModels[0];
+                fallbackAttempted[activeModel] = true;
+                console.log(`[openai ${reqId}] Race exhausted, next tier: ${activeModel}`);
+                return startOne(activeModel, activeModel);
+              }
+              const fbModel = getFallbackModel();
+              if (fbModel && !fallbackAttempted[fbModel]) {
+                fallbackAttempted[fbModel] = true;
+                activeModel = fbModel;
+                activeConfig = fbModel;
+                console.log(`[openai ${reqId}] Race exhausted, fallback model: ${activeModel}`);
+                return startOne(activeModel, activeModel);
+              }
+              // Nothing left; end stream empty-ish.
+              if (!res.writableEnded) {
+                const doneChunk = createOpenAIStreamChunk(completionId, targetModel, {}, 'stop');
+                res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+                res.write('data: [DONE]\n\n');
+                res.end();
+              }
+              return settle({ modelUsed: targetModel });
+            }
+
+            if (decision.nextModel) {
+              activeModel = decision.nextModel;
+              activeConfig = decision.nextModel;
+              console.log(`[openai ${reqId}] Retrying stream with fallback model: ${activeModel}`);
+              return startOne(activeModel, activeModel);
+            }
+          } catch (e) {
+            rejectOuter(e);
+          }
+        }
+      };
+
+      handleLlmUtilsStream(result.body, res, completionId, targetModel, saveToPath, result.logId, persistAssistant, control);
+      reqOnCloseDestroy(result.body);
+    };
+
+    const reqOnCloseDestroy = (body) => {
+      // no-op placeholder; caller wires req.on('close') once at top level
+      if (body && body._openaiCloseBound) return;
+      if (body) body._openaiCloseBound = true;
+    };
+
+    try {
+      await startOne(activeModel, activeConfig === 'auto' ? null : activeConfig);
+    } catch (e) {
+      rejectOuter(e);
     }
   });
 }
@@ -458,22 +855,20 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
       res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
       try {
-        const result = await llmUtilsChat(messages, modelName, true, options);
-
-        if (result.body) {
-          handleLlmUtilsStream(result.body, res, completionId, modelName, saveToPath, result.logId, persistAssistant);
-          req.on('close', () => {
-            if (result.body && result.body.destroy) result.body.destroy();
-          });
-        } else {
-          if (persistAssistant) {
-            try { persistAssistant('', '', null); } catch (e) { console.error('[persist] assistant (empty body) failed:', e); }
-          }
-          const doneChunk = createOpenAIStreamChunk(completionId, modelName, {}, 'stop');
-          res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-        }
+        await runOpenAIChatWithFallback({
+          messages,
+          modelName,
+          options,
+          res,
+          completionId,
+          saveToPath,
+          persistAssistant,
+          reqId,
+          isStream: true
+        });
+        req.on('close', () => {
+          // Best-effort: nothing else to destroy here; individual bodies are destroyed on fallback.
+        });
       } catch (llmErr) {
         console.log(`[llmUtilsChat] failed: ${llmErr.message}, falling back to chatCompletion`);
 
@@ -512,64 +907,23 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
       }
     } else {
       try {
-        const result = await llmUtilsChat(messages, modelName, true, options);
-        let fullContent = '';
-        let fullReasoning = '';
-        let tokenUsage = null;
-        let finishReason = 'stop';
-        const upstreamLogId = result.logId;
+        const collected = await runOpenAIChatWithFallback({
+          messages,
+          modelName,
+          options,
+          res,
+          completionId,
+          saveToPath,
+          persistAssistant,
+          reqId,
+          isStream: false
+        });
 
-        if (result.body) {
-          await new Promise((resolve, reject) => {
-            let buffer = '';
-            let currentEventName = '';
-
-            result.body.on('data', (chunk) => {
-              buffer += chunk.toString();
-              const lines = buffer.split('\n');
-              buffer = lines.pop() || '';
-
-              for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-
-                const parsed = parseLlmUtilsChatStream(trimmed, currentEventName);
-                if (!parsed) continue;
-
-                if (parsed._type === 'event_name') {
-                  currentEventName = parsed.value;
-                  if (upstreamLogId) trafficLogger.logResponseChunk(upstreamLogId, currentEventName, null);
-                  continue;
-                }
-
-                if (upstreamLogId) trafficLogger.logResponseChunk(upstreamLogId, currentEventName, parsed);
-
-                if (parsed.type === 'token_usage') {
-                  tokenUsage = parsed.data;
-                  if (upstreamLogId) trafficLogger.logTokenUsage(upstreamLogId, tokenUsage);
-                  continue;
-                }
-
-                if (parsed.type === 'done') {
-                  finishReason = parsed.finish_reason || 'stop';
-                  continue;
-                }
-
-                if (parsed.type === 'text' && parsed.content) {
-                  fullContent += parsed.content;
-                  if (upstreamLogId) trafficLogger.logResponseContent(upstreamLogId, parsed.content, null);
-                }
-                if (parsed.type === 'text' && parsed.reasoning) {
-                  fullReasoning += parsed.reasoning;
-                  if (upstreamLogId) trafficLogger.logResponseContent(upstreamLogId, null, parsed.reasoning);
-                }
-              }
-            });
-
-            result.body.on('end', resolve);
-            result.body.on('error', reject);
-          });
-        }
+        const fullContent = collected.fullContent || '';
+        const fullReasoning = collected.fullReasoning || '';
+        const tokenUsage = collected.tokenUsage || null;
+        const finishReason = collected.finishReason || 'stop';
+        const modelUsed = collected.modelUsed || modelName;
 
         const usage = tokenUsage ? {
           prompt_tokens: tokenUsage.prompt_tokens || 0,
@@ -577,9 +931,7 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
           total_tokens: tokenUsage.total_tokens || 0,
         } : undefined;
 
-        const response = createOpenAIChatCompletion(completionId, modelName, fullContent, finishReason, fullReasoning, usage);
-
-        if (upstreamLogId) trafficLogger.finalizeLog(upstreamLogId, { fullContent, fullReasoning, tokenUsage });
+        const response = createOpenAIChatCompletion(completionId, modelUsed, fullContent, finishReason, fullReasoning, usage);
 
         if (saveToPath && fullContent) {
           try {

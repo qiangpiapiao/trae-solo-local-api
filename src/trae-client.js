@@ -196,8 +196,14 @@ function rebuildDerivedMaps() {
   REVERSE_MODEL_MAP = {};
   const models = modelConfig.models || {};
   for (const [key, val] of Object.entries(models)) {
-    MODEL_TO_FUNCTION[key] = { function: val.function || 'chat_v3', config_name: val.config_name || key };
-    MODEL_MAP[key] = val.config_name || key;
+    const entry = { function: val.function || 'chat_v3', config_name: val.config_name || key };
+    // Index by original key, lowercase key, and config_name so mixed-case SOLO names resolve.
+    const aliases = new Set([key, key.toLowerCase(), entry.config_name, String(entry.config_name).toLowerCase()]);
+    for (const alias of aliases) {
+      if (!alias) continue;
+      MODEL_TO_FUNCTION[alias] = entry;
+      MODEL_MAP[alias] = entry.config_name;
+    }
   }
   MODEL_MAP['auto'] = 'auto';
   for (const [k, v] of Object.entries(MODEL_MAP)) {
@@ -216,21 +222,57 @@ function resolveModelId(modelName) {
   return lower;
 }
 
+// SOLO product uses solo_* function pools (solo_work_lite / solo_agent_lite / solo_coder).
+// chat_v3 is a crowded generic pool and queues heavily; SOLO real traffic uses solo_work_lite.
+function getDefaultAgentFunction() {
+  if (process.env.TRAE_AGENT_FUNCTION) return process.env.TRAE_AGENT_FUNCTION;
+  try {
+    const { isSoloProduct } = require('./auth');
+    if (isSoloProduct()) return process.env.TRAE_SOLO_FUNCTION || 'solo_work_lite';
+  } catch (e) {}
+  return 'chat_v3';
+}
+
 function resolveModelOptions(modelName, configNameOverride) {
   const lower = (modelName || '').toLowerCase();
+  const defaultFn = getDefaultAgentFunction();
   if (lower === 'auto' || !lower) {
+    // Keep auto on lightweight inline_chat unless user forces SOLO function.
+    if (process.env.TRAE_AUTO_FUNCTION) {
+      return { function: process.env.TRAE_AUTO_FUNCTION, config_name: null };
+    }
     return { function: 'inline_chat', config_name: null };
   }
   if (configNameOverride) {
-    return { function: 'chat_v3', config_name: configNameOverride };
+    return { function: defaultFn, config_name: configNameOverride };
   }
   if (MODEL_TO_FUNCTION[lower]) {
-    return MODEL_TO_FUNCTION[lower];
+    const mapped = { ...MODEL_TO_FUNCTION[lower] };
+    // On SOLO, rewrite legacy chat_v3 mappings to solo_work_lite pool.
+    if (defaultFn !== 'chat_v3' && (!mapped.function || mapped.function === 'chat_v3')) {
+      mapped.function = defaultFn;
+    }
+    return mapped;
   }
+  // Prefer longest key match so "glm-5-turbo" does not incorrectly hit "glm-5".
+  let best = null;
+  let bestLen = 0;
   for (const [key, val] of Object.entries(MODEL_TO_FUNCTION)) {
-    if (lower.includes(key)) return val;
+    if (lower === key || lower.includes(key) || key.includes(lower)) {
+      if (key.length > bestLen) {
+        best = { ...val };
+        bestLen = key.length;
+      }
+    }
   }
-  return { function: 'chat_v3', config_name: modelName };
+  if (best) {
+    if (defaultFn !== 'chat_v3' && (!best.function || best.function === 'chat_v3')) {
+      best.function = defaultFn;
+    }
+    return best;
+  }
+  // Unknown model name: pass through as config_name (SOLO may support it directly).
+  return { function: defaultFn, config_name: modelName };
 }
 
 function getFallbackChain(modelName) {
@@ -360,6 +402,8 @@ async function llmUtilsChat(messages, model, stream, options) {
 
     const configName = options?.config_name || modelOpts?.config_name;
     if (configName && funcName !== 'inline_chat') {
+      // SOLO-aligned pool: function=solo_work_lite + config_name/model display name.
+      // Do NOT add agent_type/device_id/ide_version here — server returns 4023 "model is unknown".
       body.config_name = configName;
       body.model = configName;
     } else {
@@ -504,13 +548,39 @@ function generateId() {
     Date.now().toString(16).slice(-8);
 }
 
+// Cache SOLO model detail configs (encrypted_model_params etc.)
+let _modelDetailCache = { at: 0, byFunction: {} };
+async function getModelConfigForFunction(functionName, configName) {
+  const fn = functionName || getDefaultAgentFunction();
+  const now = Date.now();
+  if (!_modelDetailCache.byFunction[fn] || now - _modelDetailCache.at > 10 * 60 * 1000) {
+    try {
+      const detail = await getModelDetailParam(fn);
+      _modelDetailCache.byFunction[fn] = detail;
+      _modelDetailCache.at = now;
+    } catch (e) {
+      console.error('[model-detail] fetch failed:', e.message);
+    }
+  }
+  const detail = _modelDetailCache.byFunction[fn];
+  const list = detail?.config_info_list || [];
+  if (!configName) return list[0] || null;
+  return list.find(x => x.config_name === configName || x.config_name === configName?.toLowerCase())
+    || list.find(x => String(x.config_name).toLowerCase() === String(configName).toLowerCase())
+    || null;
+}
+
 async function createAgentTask(messages, model, stream, options) {
   const { authInfo, deviceIds, apiHost } = await ensureAuth();
-  const modelId = resolveModelId(model);
+  const modelOpts = resolveModelOptions(model, options?.config_name);
+  const configName = options?.config_name || modelOpts.config_name || resolveModelId(model);
+  const agentFunction = options?.function || options?.agent_type || modelOpts.function || getDefaultAgentFunction();
+  // SOLO real traffic: agent_type == function == solo_work_lite (or solo_agent_lite / solo_coder)
+  const agentType = options?.agent_type || (agentFunction === 'chat_v3' ? 'builder_v3' : agentFunction);
 
   const sessionId = options?.session_id || generateId();
-  const taskId = generateId();
-  const messageId = generateId();
+  const taskId = options?.task_id || generateId();
+  const messageId = options?.message_id || generateId();
 
   const traeMessages = messages.map(m => ({
     role: m.role,
@@ -524,38 +594,97 @@ async function createAgentTask(messages, model, stream, options) {
 
   const workspaceDir = options?.workspace_dir || process.env.WORKSPACE_DIR || '';
   const workspaceId = options?.workspace_id || '';
+  const lastUser = [...messages].reverse().find(m => m && m.role === 'user');
+  const lastUserText = typeof lastUser?.content === 'string'
+    ? lastUser.content
+    : (Array.isArray(lastUser?.content)
+      ? lastUser.content.map(c => c?.text || '').join('')
+      : '');
 
+  // Pull real model config so server can resolve encrypted params (still may need prompt templates).
+  let modelCfg = null;
+  let modelDetail = null;
+  try {
+    modelCfg = await getModelConfigForFunction(agentType, configName);
+    modelDetail = modelCfg?.model_detail_list?.[0] || null;
+  } catch (e) {}
+
+  const deviceInfo = getDeviceInfo();
   const body = {
     session_id: sessionId,
     task_id: taskId,
     message_id: messageId,
     conversation_id: sessionId,
+    chat_session_id: sessionId,
     user_id: authInfo.userId,
     messages: traeMessages,
-    model: modelId,
+    // Prefer internal model_name (e.g. glm-5.2__dev) when available — required by create_agent_task.
+    model: modelDetail?.model_name || configName,
+    model_name: modelDetail?.model_name || configName,
+    config_name: configName,
+    function: agentType,
     stream: stream !== false,
-    mode_type: 1,
-    agent_type: 'builder_v3',
-    enable_chat_memory: false,
+    mode_type: options?.mode_type != null ? options.mode_type : 1,
+    agent_type: agentType,
+    enable_chat_memory: options?.enable_chat_memory != null ? options.enable_chat_memory : true,
+    enable_chat_memory_user_config: true,
+    enable_core_memory: false,
     workspace_folder: workspaceDir,
     workspace_id: workspaceId,
     workspace_path: workspaceDir,
+    work_mode: options?.work_mode || process.env.TRAE_WORK_MODE || 'work',
     user_input: {
       id: messageId,
-      user_input: typeof messages[messages.length - 1]?.content === 'string'
-        ? messages[messages.length - 1].content
-        : '',
+      user_input: lastUserText,
       placeholder_map: '{}',
     },
     ide_version: getIdeVersion(),
-    ide_version_code: getIdeVersionCode(),
-    device_id: getDeviceInfo().device_id,
+    device_id: deviceInfo.device_id,
+    available_tool_list: options?.available_tool_list || [],
+    mcp_tool_list: options?.mcp_tool_list || [],
+    skill_list_changed: false,
+    available_plugins: options?.available_plugins || [],
+    connector_list: options?.connector_list || [],
+    extra_context: options?.extra_context || {},
     extra_info: JSON.stringify({
       workspace_folder: workspaceDir,
       workspace_id: workspaceId,
-      workspace_path: workspaceDir
+      workspace_path: workspaceDir,
+      work_mode: options?.work_mode || process.env.TRAE_WORK_MODE || 'work'
     }),
   };
+
+  if (modelCfg) {
+    // ModelCustomConfig-shaped payload (best-effort SOLO parity)
+    body.custom_model = {
+      name: modelCfg.config_name,
+      display_name: modelCfg.display_config?.display_name || modelCfg.config_name,
+      config_name: modelCfg.config_name,
+      model_name: modelDetail?.model_name || modelCfg.config_name,
+      base_url: '',
+      use_remote_service: true,
+      multimodal: !!modelCfg.display_config?.multimodal,
+      prompt_max_tokens: modelDetail?.prompt_max_tokens,
+      toolcall_history_max_tokens: modelDetail?.tool_call_history_max_tokens || 0,
+      encrypted_model_params: modelDetail?.encrypted_model_params,
+      extra_config: modelCfg.extra_config,
+      function_extra_config: modelDetail?.model_extra_config,
+      max_turn: modelDetail?.max_turn,
+      max_tokens: modelDetail?.max_tokens,
+      is_custom_model: false,
+      is_preset: true,
+      status: true,
+    };
+    body.current_config_info = {
+      config_name: modelCfg.config_name,
+      is_custom_model: false,
+    };
+  }
+
+  // Optional raw capture override for full SOLO body (HAR/mitm dump)
+  if (options?.raw_body && typeof options.raw_body === 'object') {
+    Object.assign(body, options.raw_body);
+  }
 
   const requestId = uuidv4();
   const headers = buildStreamHeaders(authInfo, deviceIds, requestId);
@@ -570,7 +699,7 @@ async function createAgentTask(messages, model, stream, options) {
     body: body
   }, options?.workspace);
 
-  console.log(`[createAgentTask] POST ${endpoint}, model=${modelId}, stream=${stream}, session=${sessionId}, logId=${logId}`);
+  console.log(`[createAgentTask] POST ${endpoint}, agent_type=${agentType}, model=${body.model}, config=${configName}, stream=${stream}, session=${sessionId}, logId=${logId}`);
 
   const resp = await fetch(endpoint, applyProxy({
     method: 'POST',
@@ -680,7 +809,9 @@ module.exports = {
   FUNCTION_MAP,
   resolveModelId,
   resolveModelOptions,
+  getDefaultAgentFunction,
   getModelDetailParam,
+  getModelConfigForFunction,
   getChatModes,
   llmUtilsChat,
   chatCompletion,

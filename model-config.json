@@ -386,6 +386,123 @@
       "multimodal": false,
       "reasoning": false,
       "tier": 3
+    },
+    "glm-5-turbo": {
+      "function": "chat_v3",
+      "config_name": "glm-5-turbo",
+      "category": "glm",
+      "toolcall_compatible": true,
+      "multimodal": false,
+      "reasoning": true,
+      "tier": 2
+    },
+    "kimi-k3": {
+      "function": "chat_v3",
+      "config_name": "kimi-k3",
+      "category": "kimi",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 2
+    },
+    "Doubao_1_6": {
+      "function": "chat_v3",
+      "config_name": "Doubao_1_6",
+      "category": "doubao",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 5
+    },
+    "Doubao-Seed-2.0-Code": {
+      "function": "chat_v3",
+      "config_name": "Doubao-Seed-2.0-Code",
+      "category": "doubao",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 4
+    },
+    "Doubao-Seed-2.1-Pro": {
+      "function": "chat_v3",
+      "config_name": "Doubao-Seed-2.1-Pro",
+      "category": "doubao",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 2
+    },
+    "Doubao-Seed-2.1-Turbo": {
+      "function": "chat_v3",
+      "config_name": "Doubao-Seed-2.1-Turbo",
+      "category": "doubao",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 3
+    },
+    "DeepSeek-V4-Pro": {
+      "function": "chat_v3",
+      "config_name": "DeepSeek-V4-Pro",
+      "category": "deepseek",
+      "toolcall_compatible": true,
+      "multimodal": false,
+      "reasoning": true,
+      "tier": 2
+    },
+    "DeepSeek-V4-Flash": {
+      "function": "chat_v3",
+      "config_name": "DeepSeek-V4-Flash",
+      "category": "deepseek",
+      "toolcall_compatible": true,
+      "multimodal": false,
+      "reasoning": true,
+      "tier": 3
+    },
+    "qwen-3.7-plus": {
+      "function": "chat_v3",
+      "config_name": "qwen-3.7-plus",
+      "category": "qwen",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 2
+    },
+    "qwen-3.6-plus": {
+      "function": "chat_v3",
+      "config_name": "qwen-3.6-plus",
+      "category": "qwen",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 3
+    },
+    "qwen-3.5": {
+      "function": "chat_v3",
+      "config_name": "qwen-3.5",
+      "category": "qwen",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 5
+    },
+    "kimi-k2.5": {
+      "function": "chat_v3",
+      "config_name": "kimi-k2.5",
+      "category": "kimi",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 4
+    },
+    "kimi-k2.7-code": {
+      "function": "chat_v3",
+      "config_name": "kimi-k2.7-code",
+      "category": "kimi",
+      "toolcall_compatible": true,
+      "multimodal": true,
+      "reasoning": true,
+      "tier": 2
     }
   },
   "tiers": {
@@ -400,9 +517,13 @@
       "name": "强力",
       "models": [
         "glm-5.1",
+        "glm-5-turbo",
         "qwen-3.7-plus",
         "kimi-k2.6",
-        "DeepSeek-V4-Pro"
+        "kimi-k2.7-code",
+        "kimi-k3",
+        "DeepSeek-V4-Pro",
+        "Doubao-Seed-2.1-Pro"
       ],
       "description": "次旗舰，综合能力强"
     },
@@ -413,38 +534,35 @@
         "qwen-3.6-plus",
         "minimax-m3",
         "DeepSeek-V4-Flash",
-        "glm-5v-turbo"
+        "glm-5v-turbo",
+        "Doubao-Seed-2.1-Turbo"
       ],
       "description": "标准能力，性价比高"
     },
     "4": {
       "name": "轻量",
       "models": [
-        "glm-4.7",
-        "kimi-k2",
-        "qwen3-coder",
         "minimax-m2.7",
-        "Doubao-Seed-2.0-Code"
+        "Doubao-Seed-2.0-Code",
+        "kimi-k2.5"
       ],
       "description": "轻量快速"
     },
     "5": {
       "name": "最轻",
       "models": [
-        "glm-4.6",
         "Doubao_1_6",
-        "minimax-m2.1",
-        "minimax-m2"
+        "qwen-3.5"
       ],
       "description": "最轻量"
     }
   },
   "fallback": {
     "autoFallback": true,
-    "queueThreshold": 300,
+    "queueThreshold": 50,
     "tieredFallback": true,
     "raceWithinTier": true,
-    "fallbackModel": "glm-5",
+    "fallbackModel": "Doubao_1_6",
     "mappings": {
       "claude-sonnet-4-6": [
         "glm-5.1",
@@ -505,6 +623,27 @@
         "glm-5",
         "qwen-3.6-plus",
         "minimax-m2.7"
+      ],
+      "glm-5.2": [
+        "glm-5.1",
+        "glm-5-turbo",
+        "qwen-3.7-plus",
+        "Doubao_1_6"
+      ],
+      "glm-5.1": [
+        "glm-5",
+        "Doubao_1_6",
+        "minimax-m3"
+      ],
+      "DeepSeek-V4-Pro": [
+        "DeepSeek-V4-Flash",
+        "glm-5",
+        "Doubao_1_6"
+      ],
+      "DeepSeek-V4-Flash": [
+        "glm-5",
+        "Doubao_1_6",
+        "minimax-m3"
       ]
     }
   },

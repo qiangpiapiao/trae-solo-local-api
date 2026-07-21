@@ -22,6 +22,10 @@ logs/
 output/
 tmp-userdata/
 **/tmp-userdata/
+tmp-*.json
+/tmp-*.json
+captures/
+*.har
 
 # Test data & archive (探索/测试脚本不同步, but allow scripts/ and tests/ source files)
 scripts/archive/
