@@ -89,5 +89,9 @@ TODO.md         未完成项
 | 无 auth | 登录 SOLO 并对话；检查 storage 或设 `TRAE_DATA_DIR` |
 | 指定模型慢 | 日志须为 `solo_work_lite` 不是 `chat_v3` |
 | 解密失败 / 401 | 重登 SOLO 或 `TRAE_MANUAL_TOKEN` |
+| `Error 4001` param invalid | `config_name` 不在 SOLO `solo_work_lite` 目录。改用目录内模型（如 `glm-5.2` / `glm-5-turbo` / `DeepSeek-V4-Pro`）。`model-config.json` 已把幽灵别名映射到有效名；排队降级也会跳过 4001/4023 |
+| 排队后失败 | 阈值默认 50；降级链只含 SOLO 有效 `config_name`。改 `model-config.json` 的 `fallback` / tiers |
+
+同步官方模型表：`node scripts/dump-model-detail.js`（结果在 `output/`，已 gitignore）。
 
 仅供学习研究。遵守 SOLO/Trae 服务条款。

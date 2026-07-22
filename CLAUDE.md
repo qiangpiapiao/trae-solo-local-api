@@ -30,5 +30,6 @@ Node.js (Express)、node-fetch、dotenv；无打包步骤。
 
 ## 状态
 
-- 可用：解密 + `solo_work_lite` 对话 + OpenAI 排队降级  
+- 可用：解密 + `solo_work_lite` 对话 + OpenAI 排队降级 + 4001/4023 换模  
+- `model-config.json` 的 tiers/fallback **必须**是 SOLO `get_detail_param` 里真实 `config_name`（无 `glm-5.1` 等幽灵名）  
 - 待做：完整 `create_agent_task` 对齐（`TODO.md` #1）

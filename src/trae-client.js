@@ -276,9 +276,27 @@ function resolveModelOptions(modelName, configNameOverride) {
 }
 
 function getFallbackChain(modelName) {
-  const lower = (modelName || '').toLowerCase();
   const mappings = fallbackConfig.mappings || {};
-  return mappings[lower] || [];
+  if (!modelName) return [];
+  // Exact key first, then case-insensitive (mappings keep SOLO display names).
+  if (Array.isArray(mappings[modelName])) return mappings[modelName];
+  const lower = String(modelName).toLowerCase();
+  if (Array.isArray(mappings[lower])) return mappings[lower];
+  for (const [k, v] of Object.entries(mappings)) {
+    if (String(k).toLowerCase() === lower && Array.isArray(v)) return v;
+  }
+  // Also try resolved config_name (e.g. claude-haiku → glm-5-turbo chain)
+  try {
+    const resolved = resolveModelId(modelName);
+    if (resolved && resolved !== modelName) {
+      if (Array.isArray(mappings[resolved])) return mappings[resolved];
+      const rl = String(resolved).toLowerCase();
+      for (const [k, v] of Object.entries(mappings)) {
+        if (String(k).toLowerCase() === rl && Array.isArray(v)) return v;
+      }
+    }
+  } catch (e) {}
+  return [];
 }
 
 function getRaceModels() {

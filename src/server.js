@@ -263,25 +263,30 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
     if (control && typeof control.onComplete === 'function') control.onComplete({ toolCalls: collectedToolCalls });
   };
 
-  const decideFallback = (position) => {
-    if (!control || control.fallbackResolved) return null;
+  const canFallback = () => {
+    if (!control || control.fallbackResolved) return false;
     // Don't fallback mid-content if we already emitted tool calls / text
-    if (fullContent || fullReasoning || collectedToolCalls.length) return null;
+    if (fullContent || fullReasoning || collectedToolCalls.length) return false;
     const fbConfig = getFallbackConfig() || {};
-    if (!fbConfig.autoFallback || !(position > (fbConfig.queueThreshold || 300))) return null;
+    return fbConfig.autoFallback !== false;
+  };
 
+  const pickNextFallback = (reason) => {
+    if (!canFallback()) return null;
     const attempted = control.fallbackAttempted || {};
     let currentConfig = control.currentConfig;
     if (!currentConfig || currentConfig === 'auto') {
       currentConfig = resolveModelId(control.originalModel || modelName);
     }
+    // Mark the failing model so we never re-pick it in this request.
+    if (currentConfig && currentConfig !== 'auto') attempted[currentConfig] = true;
 
     if (isTieredFallbackEnabled()) {
       if (isRaceWithinTierEnabled()) {
         const sameTier = getSameTierModels(currentConfig).filter(m => !attempted[m]);
         if (sameTier.length > 0) {
           for (const m of sameTier) attempted[m] = true;
-          console.log(`[openai-fallback] Queue #${position} > threshold, RACE within tier: ${sameTier.join(', ')}`);
+          console.log(`[openai-fallback] ${reason}, RACE within tier: ${sameTier.join(', ')}`);
           return { raceModels: sameTier };
         }
       }
@@ -289,13 +294,13 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
       if (nextModels.length > 0) {
         const nextModel = nextModels[0];
         attempted[nextModel] = true;
-        console.log(`[openai-fallback] Queue #${position} > threshold, falling back to next tier: ${nextModel}`);
+        console.log(`[openai-fallback] ${reason}, next tier: ${nextModel}`);
         return { nextModel };
       }
       const fbModel = getFallbackModel();
       if (fbModel && !attempted[fbModel]) {
         attempted[fbModel] = true;
-        console.log(`[openai-fallback] All tiers exhausted, using fallback model: ${fbModel}`);
+        console.log(`[openai-fallback] ${reason}, fallback model: ${fbModel}`);
         return { nextModel: fbModel };
       }
     } else {
@@ -303,11 +308,31 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
       const nextModel = fallbackChain.find(m => !attempted[m]);
       if (nextModel) {
         attempted[nextModel] = true;
-        console.log(`[openai-fallback] Queue #${position} > threshold, falling back to ${nextModel}`);
+        console.log(`[openai-fallback] ${reason}, chain: ${nextModel}`);
         return { nextModel };
+      }
+      const fbModel = getFallbackModel();
+      if (fbModel && !attempted[fbModel]) {
+        attempted[fbModel] = true;
+        console.log(`[openai-fallback] ${reason}, fallback model: ${fbModel}`);
+        return { nextModel: fbModel };
       }
     }
     return null;
+  };
+
+  const decideFallback = (position) => {
+    const fbConfig = getFallbackConfig() || {};
+    if (!(position > (fbConfig.queueThreshold || 300))) return null;
+    return pickNextFallback(`Queue #${position} > threshold`);
+  };
+
+  const isHardModelError = (parsed) => {
+    if (!parsed || parsed.type !== 'error') return false;
+    const code = Number(parsed.code);
+    if (code === 4001 || code === 4023) return true;
+    const msg = String(parsed.message || '');
+    return /param is invalid|model is unknown|invalid model/i.test(msg);
   };
 
   const triggerFallback = (decision) => {
@@ -414,8 +439,15 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
           continue;
         }
 
-        // Fallback: other chunk types via original converter (errors etc.)
+        // Hard model/param errors (e.g. 4001 invalid config_name) → switch model, don't surface yet
         if (parsed.type === 'error') {
+          if (isHardModelError(parsed)) {
+            const decision = pickNextFallback(`error ${parsed.code || ''} ${parsed.message || ''}`.trim());
+            if (decision) {
+              triggerFallback(decision);
+              return;
+            }
+          }
           const openaiChunk = llmUtilsChunkToOpenAI(parsed, completionId, modelName, true);
           if (openaiChunk && !res.writableEnded) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
         }
@@ -496,17 +528,18 @@ async function runOpenAIChatWithFallback({
         fn();
       };
 
-      const maybeFallback = (position) => {
+      const pickNext = (reason) => {
         // Don't switch model after content started
         if (fullContent || fullReasoning || nativeToolCalls.length) return null;
         const fbConfig = getFallbackConfig() || {};
-        if (!fbConfig.autoFallback || !(position > (fbConfig.queueThreshold || 300))) return null;
+        if (fbConfig.autoFallback === false) return null;
+        if (activeConfig && activeConfig !== 'auto') fallbackAttempted[activeConfig] = true;
         if (isTieredFallbackEnabled()) {
           if (isRaceWithinTierEnabled()) {
             const sameTier = getSameTierModels(activeConfig).filter(m => !fallbackAttempted[m]);
             if (sameTier.length > 0) {
               for (const m of sameTier) fallbackAttempted[m] = true;
-              console.log(`[openai-fallback] Queue #${position} > threshold, RACE within tier: ${sameTier.join(', ')}`);
+              console.log(`[openai-fallback] ${reason}, RACE within tier: ${sameTier.join(', ')}`);
               return { raceModels: sameTier };
             }
           }
@@ -514,13 +547,13 @@ async function runOpenAIChatWithFallback({
           if (nextModels.length > 0) {
             const nextModel = nextModels[0];
             fallbackAttempted[nextModel] = true;
-            console.log(`[openai-fallback] Queue #${position} > threshold, falling back to next tier: ${nextModel}`);
+            console.log(`[openai-fallback] ${reason}, next tier: ${nextModel}`);
             return { nextModel };
           }
           const fbModel = getFallbackModel();
           if (fbModel && !fallbackAttempted[fbModel]) {
             fallbackAttempted[fbModel] = true;
-            console.log(`[openai-fallback] All tiers exhausted, using fallback model: ${fbModel}`);
+            console.log(`[openai-fallback] ${reason}, fallback model: ${fbModel}`);
             return { nextModel: fbModel };
           }
         } else {
@@ -528,11 +561,31 @@ async function runOpenAIChatWithFallback({
           const nextModel = chain.find(m => !fallbackAttempted[m]);
           if (nextModel) {
             fallbackAttempted[nextModel] = true;
-            console.log(`[openai-fallback] Queue #${position} > threshold, falling back to ${nextModel}`);
+            console.log(`[openai-fallback] ${reason}, chain: ${nextModel}`);
             return { nextModel };
+          }
+          const fbModel = getFallbackModel();
+          if (fbModel && !fallbackAttempted[fbModel]) {
+            fallbackAttempted[fbModel] = true;
+            console.log(`[openai-fallback] ${reason}, fallback model: ${fbModel}`);
+            return { nextModel: fbModel };
           }
         }
         return null;
+      };
+
+      const maybeFallback = (position) => {
+        const fbConfig = getFallbackConfig() || {};
+        if (!(position > (fbConfig.queueThreshold || 300))) return null;
+        return pickNext(`Queue #${position} > threshold`);
+      };
+
+      const isHardModelError = (parsed) => {
+        if (!parsed || parsed.type !== 'error') return false;
+        const code = Number(parsed.code);
+        if (code === 4001 || code === 4023) return true;
+        const msg = String(parsed.message || '');
+        return /param is invalid|model is unknown|invalid model/i.test(msg);
       };
 
       result.body.on('data', (chunk) => {
@@ -563,6 +616,17 @@ async function runOpenAIChatWithFallback({
                 return;
               }
             }
+            continue;
+          }
+          if (parsed.type === 'error' && isHardModelError(parsed) && !fullContent && !fullReasoning) {
+            const decision = pickNext(`error ${parsed.code || ''} ${parsed.message || ''}`.trim());
+            if (decision) {
+              fallbackDecision = decision;
+              try { result.body.destroy(); } catch (e) {}
+              settle(resolve);
+              return;
+            }
+            fullContent += `\n[Error ${parsed.code || ''}: ${parsed.message || 'unknown'}]`;
             continue;
           }
           if (parsed.type === 'token_usage') {

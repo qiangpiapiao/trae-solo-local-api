@@ -41,6 +41,13 @@
 
 实测：`solo_work_lite + glm-5.2` 正常；`chat_v3 + glm-5.2` 易大排队。
 
+### 模型目录（重要）
+
+`llm_utils_chat` 的 `config_name` 必须在 SOLO `get_detail_param(function=solo_work_lite)` 返回列表中。  
+**不在列表**（如历史 `glm-5.1`）会立刻 `4001 param is invalid`。  
+可用主力：`glm-5.2`、`glm-5-turbo`、`glm-5`、`DeepSeek-V4-Pro`、`DeepSeek-V4-Flash`、`qwen-3.7-plus`、`kimi-k*`、`Doubao-Seed-2.*` 等。  
+拉表：`node scripts/dump-model-detail.js`。本地 `model-config.json` 别名可映射到上述名；排队/错误降级也会跳过 4001/4023。
+
 ### OAuth
 SOLO ClientID：`en1oxy7wnw8j9n`（`product.json` → `authConfig.SOLO.stable`）
 

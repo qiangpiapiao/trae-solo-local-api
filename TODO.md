@@ -13,9 +13,9 @@
 
 ## 中优先级
 
-- [ ] 从 SOLO `state.vscdb` 同步模型列表
+- [ ] 从 SOLO `get_detail_param` / `state.vscdb` 自动同步 `model-config.json`（剔除幽灵 config_name）
 - [ ] 开机自启脚本
-- [ ] Claude Code / Cursor 一键配置说明
+- [ ] Claude Code / Cursor / OpenCode 一键配置说明
 
 ## 低优先级
 
