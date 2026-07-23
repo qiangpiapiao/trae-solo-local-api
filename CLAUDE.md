@@ -34,6 +34,7 @@ Node.js (Express)、node-fetch、dotenv；无打包步骤。
 - `model-config.json` 的 tiers/fallback **必须**是 SOLO `get_detail_param` 里真实 `config_name`（无 `glm-5.1` 等幽灵名）  
 - Think effort：`src/think-effort.js` + body `think_effort`；仅 `glm-5.2` / `DeepSeek-V4-Pro` / `kimi-k2.7-code`（见 `doc/think-effort.md`）  
 - Auto-continue：`src/auto-continue.js`；OpenAI+Anthropic；默认 `MAX_CONTINUES=10`；只有思考无正文必续  
+- API 目录：`GET /v1`、`GET /v1/openapi.json`（`src/api-catalog.js`）；错误形 `src/errors.js`  
 - 待做：完整 `create_agent_task` 对齐（`TODO.md` #1）
 
 ---

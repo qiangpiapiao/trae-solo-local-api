@@ -68,17 +68,19 @@ const CONFIG_PARAMS = [
     default: true,
     group: 'General',
     advanced: true,
-    description: 'Auto-continue truncated responses',
+    description:
+      'When true (default), server re-prompts if model ends with reasoning-only or truncated text (OpenAI + Anthropic). Env AUTO_CONTINUE also applies process-wide.',
   },
   {
     key: 'max_continues',
     type: 'number',
-    default: 5,
-    min: 1,
-    max: 20,
+    default: 10,
+    min: 0,
+    max: 50,
     group: 'General',
     advanced: true,
-    description: 'Maximum auto-continue rounds',
+    description:
+      'Max auto-continue rounds per request (default 10). Env MAX_CONTINUES overrides process-wide boot default.',
   },
   {
     key: 'workspace_dir',

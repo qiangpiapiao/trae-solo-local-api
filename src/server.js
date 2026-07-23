@@ -37,6 +37,8 @@ const {
   shouldAutoContinue,
   appendContinueTurn,
 } = require('./auto-continue');
+const { getCatalog, getOpenApiDocument } = require('./api-catalog');
+const { sendOpenAIError } = require('./errors');
 
 const app = express();
 app.use(cors());
@@ -78,7 +80,7 @@ function syncFileToOutput(srcPath) {
 
 function authenticate(req, res, next) {
   let token = null;
-  
+
   if (req.headers['authorization']) {
     token = req.headers['authorization'].replace('Bearer ', '');
   } else if (req.headers['x-api-key']) {
@@ -86,16 +88,39 @@ function authenticate(req, res, next) {
   } else if (req.query?.key) {
     token = req.query.key;
   }
-  
+
   if (!token) {
-    return res.status(401).json({ error: { message: 'Missing API key (Authorization header, x-api-key, or ?key= query param)', type: 'auth_error' } });
+    return sendOpenAIError(
+      res,
+      401,
+      'Missing API key (Authorization header, x-api-key, or ?key= query param)',
+      'auth_error'
+    );
   }
-  
+
   if (token !== API_KEY) {
-    return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
+    return sendOpenAIError(res, 401, 'Invalid API key', 'auth_error');
   }
   next();
 }
+
+// API catalog / OpenAPI (no auth — discovery for MCP & clients)
+app.get('/v1', (req, res) => {
+  const catalog = getCatalog();
+  const host = req.get('host');
+  const proto = req.protocol || 'http';
+  catalog.base_url = host ? `${proto}://${host}` : `http://localhost:${PORT}`;
+  catalog.features.auto_continue = AUTO_CONTINUE;
+  catalog.features.max_continues = MAX_CONTINUES;
+  res.json(catalog);
+});
+
+app.get('/v1/openapi.json', (req, res) => {
+  const host = req.get('host');
+  const proto = req.protocol || 'http';
+  const base = host ? `${proto}://${host}` : `http://localhost:${PORT}`;
+  res.json(getOpenApiDocument(base));
+});
 
 app.get('/v1/models', authenticate, (req, res) => {
   const models = Object.keys(MODEL_MAP);
@@ -1299,7 +1324,7 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
     const thinkEffort = extractThinkEffortFromBody(req.body);
 
     if (!rawMessages || !Array.isArray(rawMessages) || rawMessages.length === 0) {
-      return res.status(400).json({ error: { message: 'messages is required and must be a non-empty array', type: 'invalid_request_error' } });
+      return sendOpenAIError(res, 400, 'messages is required and must be a non-empty array');
     }
 
     const modelName = model || 'auto';
@@ -1661,22 +1686,22 @@ app.get('/v1/status', authenticate, async (req, res) => {
 app.post('/v1/encrypt', authenticate, (req, res) => {
   try {
     const { text } = req.body;
-    if (!text) return res.status(400).json({ error: 'text is required' });
+    if (!text) return sendOpenAIError(res, 400, 'text is required');
     const encrypted = encrypt(text);
     res.json({ encrypted, hash: hashContent(text) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendOpenAIError(res, 500, err.message, 'internal_error');
   }
 });
 
 app.post('/v1/decrypt', authenticate, (req, res) => {
   try {
     const { encrypted } = req.body;
-    if (!encrypted) return res.status(400).json({ error: 'encrypted is required' });
+    if (!encrypted) return sendOpenAIError(res, 400, 'encrypted is required');
     const decrypted = decrypt(encrypted);
     res.json({ decrypted });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendOpenAIError(res, 500, err.message, 'internal_error');
   }
 });
 
@@ -1686,7 +1711,7 @@ app.get('/v1/models/detail', authenticate, async (req, res) => {
     const result = await getModelDetailParam(funcName);
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendOpenAIError(res, 500, err.message, 'internal_error');
   }
 });
 
@@ -1695,7 +1720,7 @@ app.get('/v1/chat/modes', authenticate, async (req, res) => {
     const result = await getChatModes();
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    sendOpenAIError(res, 500, err.message, 'internal_error');
   }
 });
 
@@ -1908,25 +1933,38 @@ app.get('/studio', (req, res) => {
 // API info endpoint (requires auth) - moved from root
 app.get('/v1/info', authenticate, (req, res) => {
   res.json({
-    name: 'Trae Local API',
+    name: 'trae-solo-local-api',
     version: PACKAGE_VERSION,
-    description: 'OpenAI-compatible API wrapper for Trae IDE',
+    description: 'OpenAI/Anthropic-compatible local API for TRAE SOLO',
+    catalog: 'GET /v1',
+    openapi: 'GET /v1/openapi.json',
     endpoints: {
+      catalog: 'GET /v1',
+      openapi: 'GET /v1/openapi.json',
       chat: 'POST /v1/chat/completions',
       chat_file: 'POST /v1/chat/file',
       models: 'GET /v1/models',
       models_detail: 'GET /v1/models/detail?function=chat_v3',
       chat_modes: 'GET /v1/chat/modes',
       anthropic: 'POST /v1/messages',
+      think_effort: 'GET /v1/think-effort',
       files: 'GET /v1/files',
       files_read: 'GET /v1/files/read?path=xxx',
       status: 'GET /v1/status',
       encrypt: 'POST /v1/encrypt',
       decrypt: 'POST /v1/decrypt',
+      sessions: 'GET|POST /v1/sessions',
+      config_schema: 'GET /v1/config/schema',
       dashboard: 'GET / (HTML page)',
       dashboard_api: 'GET /v1/dashboard/status|sessions|requests|stats',
       info: 'GET /v1/info',
       health: 'GET /health',
+    },
+    features: {
+      think_effort: true,
+      auto_continue: AUTO_CONTINUE,
+      max_continues: MAX_CONTINUES,
+      queue_fallback: true,
     },
     primary_endpoint: '/api/agent/v3/llm_utils_chat',
     functions: Object.keys(FUNCTION_MAP),

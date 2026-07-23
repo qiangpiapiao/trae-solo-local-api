@@ -56,6 +56,26 @@ curl -s http://localhost:19900/v1/chat/completions \
 
 日志应含：`function=solo_work_lite, config_name=glm-5.2`。
 
+### 接口目录（MCP / 客户端发现）
+
+| 端点 | 说明 |
+|---|---|
+| `GET /v1` | JSON 路由目录（分组、鉴权方式、features） |
+| `GET /v1/openapi.json` | 最小 OpenAPI 3.0（供 OpenAI/Anthropic MCP 等发现） |
+| `GET /v1/info` | 需鉴权；含 endpoints + features 快照 |
+| `GET /v1/status` | 需鉴权；token / auto_continue |
+| `GET /health` | 存活探针，无鉴权 |
+
+主对话：
+
+| 协议 | 路径 |
+|---|---|
+| OpenAI | `POST /v1/chat/completions` |
+| Anthropic | `POST /v1/messages` |
+
+鉴权（三选一）：`Authorization: Bearer <API_KEY>` / `x-api-key` / `?key=`。  
+错误体统一 OpenAI 形：`{ "error": { "message", "type", "code?" } }`（`/v1/messages` 仍用 Anthropic error）。
+
 | 参数 | 后端 | 排队 |
 |---|---|---|
 | `auto` | `inline_chat` | 很轻 |
