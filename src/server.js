@@ -34,10 +34,8 @@ const {
 } = require('./think-effort');
 const {
   getContinueLimits,
-  getTruncationThresholds,
   shouldAutoContinue,
   appendContinueTurn,
-  isResponseTruncated,
 } = require('./auto-continue');
 
 const app = express();
@@ -52,14 +50,6 @@ const OUTPUT_SYNC_DIR = process.env.OUTPUT_SYNC_DIR || '';
 const _continueLimitsBoot = getContinueLimits();
 const AUTO_CONTINUE = _continueLimitsBoot.enabled;
 const MAX_CONTINUES = _continueLimitsBoot.maxContinues;
-
-function getTruncationSettings() {
-  let settings = {};
-  try {
-    settings = (getModelConfig() && getModelConfig().settings) || {};
-  } catch (e) { /* ignore */ }
-  return getTruncationThresholds(settings);
-}
 
 const pendingSyncFiles = [];
 
@@ -451,10 +441,15 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
         }
       }
     } catch (err) {
-      if (abortedForFallback) return;
+      if (abortedForFallback || streamEnded) return;
       console.error('[stream] Error in data callback:', err);
       if (logId) trafficLogger.logError(logId, err);
       try { responseBody.destroy(); } catch (e) {}
+      // holdFinish: never DONE here — outer auto-continue owns the SSE end
+      if (holdFinish) {
+        finishStream('stop');
+        return;
+      }
       if (!res.writableEnded) {
         try {
           const errChunk = createOpenAIStreamChunk(completionId, modelName, { content: `\n\n[Stream error: ${err.message}]` }, 'stop');
@@ -477,9 +472,14 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
   });
 
   responseBody.on('error', (err) => {
-    if (abortedForFallback) return;
+    if (abortedForFallback || streamEnded) return;
     console.error('[stream] error:', err);
     if (logId) trafficLogger.logError(logId, err);
+    // holdFinish: hand partial turn to outer loop (must call onTurnEnd or request hangs)
+    if (holdFinish) {
+      finishStream('stop');
+      return;
+    }
     finalizeLlmLog();
     if (!res.writableEnded) {
       const errChunk = createOpenAIStreamChunk(completionId, modelName, { content: `\n\n[Error: ${err.message}]` }, 'stop');
