@@ -27,6 +27,11 @@ const { v4: uuidv4 } = require('./uuid');
 const trafficLogger = require('./traffic-logger');
 const sessionsRepo = require('./sessions');
 const configSchema = require('./config-schema');
+const {
+  applyThinkEffort,
+  extractThinkEffortFromBody,
+  getThinkEffortSupport,
+} = require('./think-effort');
 
 const app = express();
 app.use(cors());
@@ -494,15 +499,30 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
 
 // OpenAI path queue-aware runner (mirrors Anthropic fallback behavior).
 async function runOpenAIChatWithFallback({
-  messages, modelName, options, res, completionId, saveToPath, persistAssistant, reqId, isStream, toolMap
+  messages, modelName, options, res, completionId, saveToPath, persistAssistant, reqId, isStream, toolMap, thinkEffort
 }) {
   const fallbackAttempted = {};
   let activeModel = modelName;
   let activeConfig = (modelName && modelName !== 'auto') ? resolveModelId(modelName) : 'auto';
+  const effortRaw = thinkEffort != null ? thinkEffort : options?.think_effort;
+
+  /** Re-bind system prefix for current SOLO config (strip old marker first). */
+  const bindThinkEffort = (configForEffort, label) => {
+    const cfg = configForEffort && configForEffort !== 'auto' ? configForEffort : modelName;
+    const { meta } = applyThinkEffort(messages, cfg, effortRaw);
+    if (reqId && meta) {
+      console.log(
+        `[think_effort ${reqId}] ${label || 'bind'} model=${cfg} family=${meta.family || '-'} ` +
+        `effort=${meta.effort} injected=${meta.injected ? 'yes' : 'no'} reason=${meta.reason}`
+      );
+    }
+    return meta;
+  };
 
   const collectNonStream = async (targetModel, configNameOverride) => {
     const callOpts = { ...options };
     if (configNameOverride) callOpts.config_name = configNameOverride;
+    bindThinkEffort(configNameOverride || resolveModelId(targetModel) || targetModel, 'nonstream');
     const result = await llmUtilsChat(messages, targetModel, true, callOpts);
     let fullContent = '';
     let fullReasoning = '';
@@ -751,6 +771,7 @@ async function runOpenAIChatWithFallback({
       if (res.writableEnded) return settle({ modelUsed: targetModel });
       const callOpts = { ...options };
       if (configNameOverride) callOpts.config_name = configNameOverride;
+      bindThinkEffort(configNameOverride || resolveModelId(targetModel) || targetModel, 'stream');
       let result;
       try {
         result = await llmUtilsChat(messages, targetModel, true, callOpts);
@@ -786,6 +807,7 @@ async function runOpenAIChatWithFallback({
                 // Try one race model; if it also falls back, continue.
                 let raceFellBack = false;
                 await new Promise((resolveRace) => {
+                  bindThinkEffort(raceModel, 'race');
                   llmUtilsChat(messages, raceModel, true, { ...options, config_name: raceModel }).then((raceResult) => {
                     if (!raceResult.body) {
                       resolveRace();
@@ -1139,6 +1161,7 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
 
   try {
     const { messages: rawMessages, model, stream, temperature, max_tokens, function: funcName, config_name, workspace_dir, save_to, tools, tool_choice } = req.body;
+    const thinkEffort = extractThinkEffortFromBody(req.body);
 
     if (!rawMessages || !Array.isArray(rawMessages) || rawMessages.length === 0) {
       return res.status(400).json({ error: { message: 'messages is required and must be a non-empty array', type: 'invalid_request_error' } });
@@ -1150,7 +1173,7 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
     // OpenCode / OpenAI clients send tools + tool role messages — normalize for Trae
     const { messages, toolMap, isToolContinuation } = prepareOpenAIMessagesForTrae(rawMessages, tools, reqId);
 
-    console.log(`[openai ${reqId}] POST /v1/chat/completions model=${modelName} stream=${isStream} messages=${messages.length} function=${funcName || 'auto'} has_tools=${!!(tools && tools.length)} toolContinuation=${isToolContinuation}`);
+    console.log(`[openai ${reqId}] POST /v1/chat/completions model=${modelName} stream=${isStream} messages=${messages.length} function=${funcName || 'auto'} has_tools=${!!(tools && tools.length)} toolContinuation=${isToolContinuation} think_effort=${thinkEffort ?? '(pending)'}`);
     const completionId = `chatcmpl-${uuidv4()}`;
 
     let saveToPath = null;
@@ -1210,6 +1233,16 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
     if (config_name) options.config_name = config_name;
     if (workspace_dir) options.workspace_dir = workspace_dir;
     options.workspace = extractWorkspace(req);
+    // think_effort is applied to messages in-process; keep raw value for fallback re-bind
+    if (thinkEffort != null) options.think_effort = thinkEffort;
+    else if (sessionId) {
+      try {
+        const sess = sessionsRepo.getSession(sessionId);
+        if (sess?.config?.think_effort != null && sess.config.think_effort !== '' && sess.config.think_effort !== 'auto') {
+          options.think_effort = sess.config.think_effort;
+        }
+      } catch (e) { /* ignore */ }
+    }
 
     // Phase 4: Forward sampling params from request body (explicit) or session config
     const samplingKeys = ['temperature', 'top_p', 'max_tokens', 'presence_penalty', 'frequency_penalty', 'stop', 'seed', 'n'];
@@ -1239,6 +1272,18 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
       }
     }
 
+    // Initial think_effort bind after options/session defaults resolved.
+    // Fallback path re-applies with the active config_name each attempt.
+    {
+      const effort = options.think_effort != null ? options.think_effort : thinkEffort;
+      const cfg = options.config_name || resolveModelId(modelName) || modelName;
+      const { meta } = applyThinkEffort(messages, cfg, effort);
+      console.log(
+        `[think_effort ${reqId}] init model=${cfg} family=${meta.family || '-'} ` +
+        `effort=${meta.effort} injected=${meta.injected ? 'yes' : 'no'} reason=${meta.reason}`
+      );
+    }
+
     if (isStream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -1263,7 +1308,8 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
           persistAssistant,
           reqId,
           isStream: true,
-          toolMap
+          toolMap,
+          thinkEffort: options.think_effort != null ? options.think_effort : thinkEffort,
         });
         req.on('close', () => {
           // Best-effort: nothing else to destroy here; individual bodies are destroyed on fallback.
@@ -1316,7 +1362,8 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
           persistAssistant,
           reqId,
           isStream: false,
-          toolMap
+          toolMap,
+          thinkEffort: options.think_effort != null ? options.think_effort : thinkEffort,
         });
 
         let fullContent = collected.fullContent || '';
@@ -1911,6 +1958,11 @@ app.get('/v1/dashboard/active/:logId', authenticate, (req, res) => {
   res.json(detail);
 });
 
+// Think-effort support matrix (system-prompt injection for reasoning depth)
+app.get('/v1/think-effort', authenticate, (req, res) => {
+  res.json(getThinkEffortSupport());
+});
+
 // Fallback config API
 app.get('/v1/dashboard/fallback-config', authenticate, (req, res) => {
   res.json(getFallbackConfig());
@@ -2016,6 +2068,7 @@ app.post('/v1/messages', authenticate, async (req, res) => {
 
   try {
     const { model, messages, max_tokens, system, stream, temperature, tools, tool_choice, thinking } = req.body;
+    const thinkEffort = extractThinkEffortFromBody(req.body);
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json(createAnthropicError({
@@ -2028,7 +2081,7 @@ app.post('/v1/messages', authenticate, async (req, res) => {
     const isStream = stream === true;
     const messageId = `msg_${uuidv4().replace(/-/g, '').substring(0, 24)}`;
 
-    console.log(`[anthropic ${reqId}] POST /v1/messages model=${modelName} stream=${isStream} messages=${messages.length} max_tokens=${max_tokens || 'default'} has_tools=${!!tools} has_system=${!!system} thinking=${JSON.stringify(thinking) || 'none'}`);
+    console.log(`[anthropic ${reqId}] POST /v1/messages model=${modelName} stream=${isStream} messages=${messages.length} max_tokens=${max_tokens || 'default'} has_tools=${!!tools} has_system=${!!system} thinking=${JSON.stringify(thinking) || 'none'} think_effort=${thinkEffort ?? 'auto'}`);
 
     const openaiMessages = anthropicToOpenAIMessages(messages, system);
 
@@ -2146,6 +2199,7 @@ app.post('/v1/messages', authenticate, async (req, res) => {
     if (max_tokens) options.max_tokens = max_tokens;
     if (temperature !== undefined) options.temperature = temperature;
     options.workspace = extractWorkspace(req);
+    if (thinkEffort != null) options.think_effort = thinkEffort;
 
     // Multimodal detection: if messages contain image content, switch to a multimodal model
     const hasImageContent = openaiMessages.some(m => {
@@ -2165,6 +2219,16 @@ app.post('/v1/messages', authenticate, async (req, res) => {
           options.config_name = mmModel;
         }
       }
+    }
+
+    // Initial think_effort bind (re-applied on each fallback / processStream with that config)
+    {
+      const cfg = options.config_name || resolveModelId(modelName) || modelName;
+      const { meta } = applyThinkEffort(openaiMessages, cfg, options.think_effort);
+      console.log(
+        `[think_effort ${reqId}] init model=${cfg} family=${meta.family || '-'} ` +
+        `effort=${meta.effort} injected=${meta.injected ? 'yes' : 'no'} reason=${meta.reason}`
+      );
     }
 
     if (isStream) {
@@ -2202,6 +2266,12 @@ app.post('/v1/messages', authenticate, async (req, res) => {
         if (configNameOverride) {
           currentConfigName = configNameOverride;
         }
+        const cfg = configNameOverride || options?.config_name || resolveModelId(modelName) || modelName;
+        const { meta } = applyThinkEffort(messages, cfg, options.think_effort);
+        console.log(
+          `[think_effort ${reqId}] stream model=${cfg} family=${meta.family || '-'} ` +
+          `effort=${meta.effort} injected=${meta.injected ? 'yes' : 'no'} reason=${meta.reason}`
+        );
         const result = await llmUtilsChat(messages, modelName, true, { ...options, config_name: configNameOverride || options?.config_name });
         const logId = result.logId;
 
@@ -2612,6 +2682,14 @@ app.post('/v1/messages', authenticate, async (req, res) => {
       }
     } else {
       try {
+        {
+          const cfg = options.config_name || resolveModelId(modelName) || modelName;
+          const { meta } = applyThinkEffort(openaiMessages, cfg, options.think_effort);
+          console.log(
+            `[think_effort ${reqId}] nonstream model=${cfg} family=${meta.family || '-'} ` +
+            `effort=${meta.effort} injected=${meta.injected ? 'yes' : 'no'} reason=${meta.reason}`
+          );
+        }
         const result = await llmUtilsChat(openaiMessages, modelName, true, options);
         let fullContent = '';
         let fullReasoning = '';

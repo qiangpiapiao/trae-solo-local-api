@@ -26,6 +26,16 @@ const CONFIG_PARAMS = [
     description: 'System prompt prepended to every conversation',
   },
   {
+    key: 'think_effort',
+    type: 'enum',
+    default: 'auto',
+    enum: ['auto', 'off', 'low', 'high', 'max'],
+    group: 'Model',
+    advanced: true,
+    description:
+      'Inject model-specific reasoning-depth prefix into system prompt. Supported: glm-5.2 (high|max), DeepSeek-V4-Pro (max), kimi-k2.7-code (low|max). auto/off = no inject. See doc/think-effort.md',
+  },
+  {
     key: 'function',
     type: 'enum',
     default: 'default',
