@@ -18,6 +18,7 @@
 | 排队降级 | OpenAI `/v1/chat/completions` 也支持超阈值换模型 |
 | 模型表 | 补充 SOLO 侧模型/别名与 fallback |
 | Think effort | 按模型注入 reasoning-effort system 前缀；对外 `think_effort`（见下） |
+| Auto-continue | 只有思考/半截输出时自动再请求；OpenAI `/v1/chat/completions` + Anthropic `/v1/messages`（`src/auto-continue.js`） |
 | 文档 | 短 README + `SOLO_PARITY.md` / `TODO.md` / `doc/think-effort.md` |
 
 > **排队**：Trae CN `chat_v3` 很重；SOLO `solo_work_lite` 较轻。默认按 SOLO。
@@ -134,6 +135,24 @@ TODO.md         未完成项
 | `Error 4001` param invalid | `config_name` 不在 SOLO `solo_work_lite` 目录。改用目录内模型（如 `glm-5.2` / `glm-5-turbo` / `DeepSeek-V4-Pro`）。`model-config.json` 已把幽灵别名映射到有效名；排队降级也会跳过 4001/4023 |
 | 排队后失败 | 阈值默认 50；降级链只含 SOLO 有效 `config_name`。改 `model-config.json` 的 `fallback` / tiers |
 | `think_effort` 无效果 | 仅三模型见上表；`auto`/`off` 不注入；看日志 `injected=yes/no`；fallback 换到不支持模型会 strip |
+| OpenCode 思考后无下文 | 已开 auto-continue（默认）。日志应有 `auto_continue … reason=reasoning_only`；`AUTO_CONTINUE=false` 可关；上限 `MAX_CONTINUES`（默认 10） |
+
+### Auto-continue（长思考不空结束）
+
+SOLO 有时流结束时**只有 reasoning、无正文/无 tool**。OpenCode 走 `/v1/chat/completions` 时会表现为「正常结束但没答案」。
+
+服务端统一逻辑（`src/auto-continue.js`）：
+
+- **必续**：只有思考；`finish_reason=length`；半截（未闭合代码块等）
+- **不续**：已有 tool_calls；正文完整；`AUTO_CONTINUE=false`；达到 `MAX_CONTINUES`
+- OpenAI 流式：中间 delta 照发，**不提前** `DONE`；到完整或到顶才结束
+- Anthropic 流式：同一套判定
+
+```bash
+# .env
+AUTO_CONTINUE=true
+MAX_CONTINUES=10
+```
 
 同步官方模型表：`node scripts/dump-model-detail.js`（结果在 `output/`，已 gitignore）。
 

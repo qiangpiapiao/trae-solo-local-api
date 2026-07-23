@@ -32,6 +32,13 @@ const {
   extractThinkEffortFromBody,
   getThinkEffortSupport,
 } = require('./think-effort');
+const {
+  getContinueLimits,
+  getTruncationThresholds,
+  shouldAutoContinue,
+  appendContinueTurn,
+  isResponseTruncated,
+} = require('./auto-continue');
 
 const app = express();
 app.use(cors());
@@ -41,16 +48,17 @@ const API_KEY = process.env.API_KEY || 'trae-solo-local-api-key';
 const PORT = process.env.PORT || 19900;
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || '';
 const OUTPUT_SYNC_DIR = process.env.OUTPUT_SYNC_DIR || '';
-const AUTO_CONTINUE = process.env.AUTO_CONTINUE !== 'false'; // default true
-const MAX_CONTINUES = parseInt(process.env.MAX_CONTINUES || '5', 10);
+// Defaults live in auto-continue.js (MAX_CONTINUES default 10). Env still wins.
+const _continueLimitsBoot = getContinueLimits();
+const AUTO_CONTINUE = _continueLimitsBoot.enabled;
+const MAX_CONTINUES = _continueLimitsBoot.maxContinues;
 
-// Truncation detection thresholds (read from model-config.json settings, with env overrides)
 function getTruncationSettings() {
-  const settings = (modelConfig && modelConfig.settings) || {};
-  return {
-    textThreshold: parseInt(process.env.TRUNCATION_TEXT_THRESHOLD || settings.truncationTextThreshold || '200', 10),
-    similarityThreshold: parseFloat(process.env.TRUNCATION_SIMILARITY_THRESHOLD || settings.truncationSimilarityThreshold || '0.5'),
-  };
+  let settings = {};
+  try {
+    settings = (getModelConfig() && getModelConfig().settings) || {};
+  } catch (e) { /* ignore */ }
+  return getTruncationThresholds(settings);
 }
 
 const pendingSyncFiles = [];
@@ -61,54 +69,6 @@ sessionsRepo.setGlobalDefaults(globalDefaults);
 
 // 服务启动时间 (moved here to be available for /health and /v1/dashboard/status routes)
 const serverStartTime = Date.now();
-
-/**
- * Detect if the model response was truncated and should be auto-continued.
- * Returns true if the response seems incomplete.
- */
-function isResponseTruncated(state) {
-  if (!state || !state.messageStarted) return false;
-
-  if (state.hasToolUse) return false;
-
-  if (state.stopReason === 'max_tokens') return true;
-
-  const text = state.textContent || '';
-  const reasoning = state.reasoningContent || '';
-
-  if (!text && !state.hasToolUse && reasoning.length > 0) return true;
-
-  const { textThreshold } = getTruncationSettings();
-  if (!state.hasToolUse && reasoning.length > 0 && text.length < textThreshold) return true;
-
-  if (!text) return false;
-
-  // Open code block (``` without closing ```)
-  const codeBlockOpens = (text.match(/```/g) || []).length;
-  if (codeBlockOpens % 2 !== 0) return true;
-
-  // Unclosed brackets/braces/parens at the end (common in code output)
-  const last100 = text.slice(-100).trim();
-  const openBrackets = (last100.match(/[\[{(]/g) || []).length;
-  const closeBrackets = (last100.match(/[\]})]/g) || []).length;
-  if (openBrackets > closeBrackets + 2) return true;
-
-  // Ends mid-sentence (common truncation patterns)
-  const truncatedEndings = [
-    /,\s*$/,           // trailing comma
-    /\|\s*$/,          // trailing pipe (table)
-    /\.\.\.\s*$/,      // ellipsis
-    /\\\s*$/,          // trailing backslash
-    /\/\/\s*$/,        // trailing comment
-    /#\s*$/,           // trailing hash comment
-    /-\s*$/,           // trailing dash (list item)
-  ];
-  for (const pattern of truncatedEndings) {
-    if (pattern.test(last100)) return true;
-  }
-
-  return false;
-}
 
 function syncFileToOutput(srcPath) {
   if (!OUTPUT_SYNC_DIR) return;
@@ -222,10 +182,9 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
     }
   };
 
-  const finishStream = (finishReason) => {
-    if (streamEnded || res.writableEnded) return;
-    streamEnded = true;
-    // Flush any buffered partial toolcall filter (may salvage complete JSON)
+  const holdFinish = !!(control && control.holdFinish);
+
+  const flushToolFilter = () => {
     try {
       const flushed = toolFilter.flush();
       if (flushed.emitText) {
@@ -236,6 +195,40 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
         writeToolCallChunks(flushed.finishedToolCalls);
       }
     } catch (e) {}
+  };
+
+  const buildTurnResult = (finishReason) => {
+    let reason = finishReason || 'stop';
+    if (collectedToolCalls.length > 0) reason = 'tool_calls';
+    return {
+      fullContent,
+      fullReasoning,
+      tokenUsage,
+      finishReason: reason,
+      toolCalls: collectedToolCalls.slice(),
+      messageStarted: !!(fullContent || fullReasoning || collectedToolCalls.length),
+      hasToolUse: collectedToolCalls.length > 0,
+      textContent: fullContent,
+      reasoningContent: fullReasoning,
+      stopReason: reason === 'tool_calls' ? 'tool_use' : (reason === 'length' ? 'max_tokens' : reason),
+    };
+  };
+
+  const finishStream = (finishReason) => {
+    if (streamEnded || res.writableEnded) return;
+    streamEnded = true;
+    flushToolFilter();
+
+    // holdFinish: outer auto-continue loop owns DONE / res.end
+    if (holdFinish) {
+      finalizeLlmLog();
+      if (control && typeof control.onTurnEnd === 'function') {
+        try { control.onTurnEnd(buildTurnResult(finishReason)); } catch (e) {
+          console.error('[stream] onTurnEnd error:', e);
+        }
+      }
+      return;
+    }
 
     if (saveToPath && fullContent) {
       try {
@@ -705,60 +698,133 @@ async function runOpenAIChatWithFallback({
     return { fullContent, fullReasoning, tokenUsage, finishReason, toolCalls, fallbackDecision };
   };
 
-  // Non-stream: loop with fallback until content or no more fallbacks.
-  if (!isStream) {
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const collected = await collectNonStream(activeModel, activeConfig === 'auto' ? null : activeConfig);
-      if (collected.fallbackDecision) {
-        if (collected.fallbackDecision.raceModels && collected.fallbackDecision.raceModels.length) {
-          // Try race models sequentially for non-stream (simpler, still effective).
-          let raceHit = false;
-          for (const raceModel of collected.fallbackDecision.raceModels) {
-            activeModel = raceModel;
-            activeConfig = raceModel;
-            const raceCollected = await collectNonStream(raceModel, raceModel);
-            if (!raceCollected.fallbackDecision && (raceCollected.fullContent || raceCollected.fullReasoning)) {
-              return { ...raceCollected, modelUsed: raceModel };
-            }
-            if (!raceCollected.fallbackDecision) {
-              // finished with empty content; still return
-              return { ...raceCollected, modelUsed: raceModel };
-            }
-            raceHit = true;
-          }
-          if (raceHit) {
-            // all race models queued — drop to next tier below original
-            const nextModels = getNextTierModels(resolveModelId(modelName), Object.keys(fallbackAttempted));
-            if (nextModels.length) {
-              activeModel = nextModels[0];
-              activeConfig = nextModels[0];
-              fallbackAttempted[activeModel] = true;
-              continue;
-            }
-            const fbModel = getFallbackModel();
-            if (fbModel && !fallbackAttempted[fbModel]) {
-              activeModel = fbModel;
-              activeConfig = fbModel;
-              fallbackAttempted[fbModel] = true;
-              continue;
-            }
-          }
-          // give up racing; return empty-ish with last attempt
-          return { ...collected, modelUsed: activeModel };
-        }
-        if (collected.fallbackDecision.nextModel) {
-          activeModel = collected.fallbackDecision.nextModel;
-          activeConfig = collected.fallbackDecision.nextModel;
-          console.log(`[openai ${reqId}] Retrying non-stream with fallback model: ${activeModel}`);
-          continue;
-        }
-      }
-      return { ...collected, modelUsed: activeModel };
+  const continueSettings = (() => {
+    try {
+      return (getModelConfig() && getModelConfig().settings) || {};
+    } catch (e) {
+      return {};
     }
-    return { fullContent: '', fullReasoning: '', tokenUsage: null, finishReason: 'stop', modelUsed: activeModel };
+  })();
+  const continueOptsBase = {
+    enabled: AUTO_CONTINUE,
+    maxContinues: MAX_CONTINUES,
+    settings: continueSettings,
+  };
+
+  // Non-stream: fallback loop, then auto-continue until real answer or cap.
+  if (!isStream) {
+    const runOneNonStream = async () => {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const collected = await collectNonStream(activeModel, activeConfig === 'auto' ? null : activeConfig);
+        if (collected.fallbackDecision) {
+          if (collected.fallbackDecision.raceModels && collected.fallbackDecision.raceModels.length) {
+            let raceHit = false;
+            for (const raceModel of collected.fallbackDecision.raceModels) {
+              activeModel = raceModel;
+              activeConfig = raceModel;
+              const raceCollected = await collectNonStream(raceModel, raceModel);
+              if (!raceCollected.fallbackDecision && (raceCollected.fullContent || raceCollected.fullReasoning)) {
+                return { ...raceCollected, modelUsed: raceModel };
+              }
+              if (!raceCollected.fallbackDecision) {
+                return { ...raceCollected, modelUsed: raceModel };
+              }
+              raceHit = true;
+            }
+            if (raceHit) {
+              const nextModels = getNextTierModels(resolveModelId(modelName), Object.keys(fallbackAttempted));
+              if (nextModels.length) {
+                activeModel = nextModels[0];
+                activeConfig = nextModels[0];
+                fallbackAttempted[activeModel] = true;
+                continue;
+              }
+              const fbModel = getFallbackModel();
+              if (fbModel && !fallbackAttempted[fbModel]) {
+                activeModel = fbModel;
+                activeConfig = fbModel;
+                fallbackAttempted[fbModel] = true;
+                continue;
+              }
+            }
+            return { ...collected, modelUsed: activeModel };
+          }
+          if (collected.fallbackDecision.nextModel) {
+            activeModel = collected.fallbackDecision.nextModel;
+            activeConfig = collected.fallbackDecision.nextModel;
+            console.log(`[openai ${reqId}] Retrying non-stream with fallback model: ${activeModel}`);
+            continue;
+          }
+        }
+        return { ...collected, modelUsed: activeModel };
+      }
+      return { fullContent: '', fullReasoning: '', tokenUsage: null, finishReason: 'stop', toolCalls: [], modelUsed: activeModel };
+    };
+
+    let aggregated = {
+      fullContent: '',
+      fullReasoning: '',
+      tokenUsage: null,
+      finishReason: 'stop',
+      toolCalls: [],
+      modelUsed: activeModel,
+    };
+    let continueCount = 0;
+    let lastShortText = null;
+
+    for (;;) {
+      const turn = await runOneNonStream();
+      if (turn.fullContent) aggregated.fullContent += turn.fullContent;
+      if (turn.fullReasoning) {
+        aggregated.fullReasoning = aggregated.fullReasoning
+          ? `${aggregated.fullReasoning}\n${turn.fullReasoning}`
+          : turn.fullReasoning;
+      }
+      if (turn.tokenUsage) aggregated.tokenUsage = turn.tokenUsage;
+      if (turn.toolCalls && turn.toolCalls.length) {
+        aggregated.toolCalls = [...(aggregated.toolCalls || []), ...turn.toolCalls];
+      }
+      aggregated.finishReason = turn.finishReason || 'stop';
+      aggregated.modelUsed = turn.modelUsed || activeModel;
+
+      const decision = shouldAutoContinue(
+        {
+          fullContent: turn.fullContent,
+          fullReasoning: turn.fullReasoning,
+          finishReason: turn.finishReason,
+          toolCalls: turn.toolCalls,
+          messageStarted: !!(turn.fullContent || turn.fullReasoning || (turn.toolCalls && turn.toolCalls.length)),
+        },
+        { ...continueOptsBase, continueCount, lastShortText }
+      );
+
+      if (!decision.shouldContinue) {
+        if (decision.finishReason === 'length') aggregated.finishReason = 'length';
+        if (decision.reason === 'cap_reached') {
+          console.log(`[openai ${reqId}] auto_continue cap (${continueCount}/${MAX_CONTINUES}) reason=${decision.reason}`);
+        }
+        break;
+      }
+
+      console.log(
+        `[openai ${reqId}] auto_continue nonstream reason=${decision.reason} ` +
+        `(${continueCount + 1}/${MAX_CONTINUES})`
+      );
+      appendContinueTurn(messages, turn, decision.continueMessage);
+      if (decision.isShortResponse) {
+        lastShortText = (turn.fullContent || '').trim();
+      }
+      continueCount++;
+    }
+
+    if (aggregated.toolCalls && aggregated.toolCalls.length &&
+        (!aggregated.finishReason || aggregated.finishReason === 'stop')) {
+      aggregated.finishReason = 'tool_calls';
+    }
+    return aggregated;
   }
 
-  // Stream path with fallback.
+  // Stream path: fallback + auto-continue. holdFinish defers DONE until real answer or cap.
   return await new Promise(async (resolveOuter, rejectOuter) => {
     let settled = false;
     const settle = (v) => {
@@ -767,8 +833,49 @@ async function runOpenAIChatWithFallback({
       resolveOuter(v);
     };
 
-    const startOne = async (targetModel, configNameOverride) => {
-      if (res.writableEnded) return settle({ modelUsed: targetModel });
+    let continueCount = 0;
+    let lastShortText = null;
+    let aggregateContent = '';
+    let aggregateReasoning = '';
+    let lastTokenUsage = null;
+    let lastToolCalls = [];
+    let activeStreamModel = activeModel;
+
+    const endStreamFinally = (finishReason, modelUsed) => {
+      if (res.writableEnded) return settle({ modelUsed });
+      let reason = finishReason || 'stop';
+      if (lastToolCalls.length > 0) reason = 'tool_calls';
+
+      if (saveToPath && aggregateContent) {
+        try {
+          const dir = path.dirname(saveToPath);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(saveToPath, aggregateContent, 'utf-8');
+          console.log(`[file] Saved to: ${saveToPath}`);
+          syncFileToOutput(saveToPath);
+          const savedChunk = createOpenAIStreamChunk(completionId, modelUsed, {
+            content: `\n\n[File saved: ${saveToPath}]`,
+          }, null);
+          res.write(`data: ${JSON.stringify(savedChunk)}\n\n`);
+        } catch (fileErr) {
+          console.error(`[file] Save failed: ${fileErr.message}`);
+        }
+      }
+
+      if (typeof persistAssistant === 'function') {
+        try { persistAssistant(aggregateContent, aggregateReasoning, lastTokenUsage, lastToolCalls); }
+        catch (e) { console.error('[persist] stream final failed:', e); }
+      }
+
+      const doneChunk = createOpenAIStreamChunk(completionId, modelUsed, {}, reason);
+      res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      settle({ modelUsed, toolCalls: lastToolCalls });
+    };
+
+    const runStreamTurn = (targetModel, configNameOverride) => new Promise(async (resolveTurn, rejectTurn) => {
+      if (res.writableEnded) return resolveTurn({ aborted: true, modelUsed: targetModel });
       const callOpts = { ...options };
       if (configNameOverride) callOpts.config_name = configNameOverride;
       bindThinkEffort(configNameOverride || resolveModelId(targetModel) || targetModel, 'stream');
@@ -776,17 +883,25 @@ async function runOpenAIChatWithFallback({
       try {
         result = await llmUtilsChat(messages, targetModel, true, callOpts);
       } catch (err) {
-        return rejectOuter(err);
+        return rejectTurn(err);
       }
       if (!result.body) {
-        if (!res.writableEnded) {
-          const doneChunk = createOpenAIStreamChunk(completionId, targetModel, {}, 'stop');
-          res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-        }
-        return settle({ modelUsed: targetModel });
+        return resolveTurn({
+          emptyBody: true,
+          modelUsed: targetModel,
+          fullContent: '',
+          fullReasoning: '',
+          finishReason: 'stop',
+          toolCalls: [],
+        });
       }
+
+      let turnResolved = false;
+      const resolveOnce = (payload) => {
+        if (turnResolved) return;
+        turnResolved = true;
+        resolveTurn(payload);
+      };
 
       const control = {
         originalModel: modelName,
@@ -795,99 +910,119 @@ async function runOpenAIChatWithFallback({
         fallbackResolved: false,
         reqId,
         toolMap,
-        onComplete: () => settle({ modelUsed: targetModel }),
+        holdFinish: true,
+        onTurnEnd: (turn) => {
+          resolveOnce({ ...turn, modelUsed: targetModel, fallback: false });
+        },
         onFallback: async (decision) => {
-          try {
-            if (decision.raceModels && decision.raceModels.length) {
-              console.log(`[openai ${reqId}] Launching TIER RACE: ${decision.raceModels.join(', ')}`);
-              // Sequential race for stream to avoid interleaving multiple bodies into one response.
-              for (const raceModel of decision.raceModels) {
-                activeModel = raceModel;
-                activeConfig = raceModel;
-                // Try one race model; if it also falls back, continue.
-                let raceFellBack = false;
-                await new Promise((resolveRace) => {
-                  bindThinkEffort(raceModel, 'race');
-                  llmUtilsChat(messages, raceModel, true, { ...options, config_name: raceModel }).then((raceResult) => {
-                    if (!raceResult.body) {
-                      resolveRace();
-                      return;
-                    }
-                    const raceControl = {
-                      originalModel: modelName,
-                      currentConfig: raceModel,
-                      fallbackAttempted,
-                      fallbackResolved: false,
-                      reqId,
-                      toolMap,
-                      onComplete: () => resolveRace(),
-                      onFallback: () => {
-                        raceFellBack = true;
-                        resolveRace();
-                      }
-                    };
-                    handleLlmUtilsStream(raceResult.body, res, completionId, raceModel, saveToPath, raceResult.logId, persistAssistant, raceControl);
-                    reqOnCloseDestroy(raceResult.body);
-                  }).catch((e) => {
-                    console.error(`[openai ${reqId}] race model ${raceModel} failed:`, e.message);
-                    resolveRace();
-                  });
-                });
-                if (!raceFellBack) {
-                  return settle({ modelUsed: raceModel });
-                }
-              }
-              // All race models queued — try next tier / fallback model.
-              const nextModels = getNextTierModels(resolveModelId(modelName), Object.keys(fallbackAttempted));
-              if (nextModels.length) {
-                activeModel = nextModels[0];
-                activeConfig = nextModels[0];
-                fallbackAttempted[activeModel] = true;
-                console.log(`[openai ${reqId}] Race exhausted, next tier: ${activeModel}`);
-                return startOne(activeModel, activeModel);
-              }
-              const fbModel = getFallbackModel();
-              if (fbModel && !fallbackAttempted[fbModel]) {
-                fallbackAttempted[fbModel] = true;
-                activeModel = fbModel;
-                activeConfig = fbModel;
-                console.log(`[openai ${reqId}] Race exhausted, fallback model: ${activeModel}`);
-                return startOne(activeModel, activeModel);
-              }
-              // Nothing left; end stream empty-ish.
-              if (!res.writableEnded) {
-                const doneChunk = createOpenAIStreamChunk(completionId, targetModel, {}, 'stop');
-                res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
-                res.write('data: [DONE]\n\n');
-                res.end();
-              }
-              return settle({ modelUsed: targetModel });
-            }
-
-            if (decision.nextModel) {
-              activeModel = decision.nextModel;
-              activeConfig = decision.nextModel;
-              console.log(`[openai ${reqId}] Retrying stream with fallback model: ${activeModel}`);
-              return startOne(activeModel, activeModel);
-            }
-          } catch (e) {
-            rejectOuter(e);
-          }
-        }
+          // Queue/model switch: do not auto-continue this body; outer handles fallback
+          resolveOnce({ fallback: true, decision, modelUsed: targetModel });
+        },
       };
 
-      handleLlmUtilsStream(result.body, res, completionId, targetModel, saveToPath, result.logId, persistAssistant, control);
-      reqOnCloseDestroy(result.body);
-    };
+      // When not holding (legacy), onComplete settles; with holdFinish onTurnEnd fires
+      control.onComplete = () => {
+        if (!control.holdFinish) resolveOnce({ modelUsed: targetModel, fullContent: '', fullReasoning: '', finishReason: 'stop', toolCalls: [] });
+      };
 
-    const reqOnCloseDestroy = (body) => {
-      // no-op placeholder; caller wires req.on('close') once at top level
-      if (body && body._openaiCloseBound) return;
-      if (body) body._openaiCloseBound = true;
+      handleLlmUtilsStream(result.body, res, completionId, targetModel, null, result.logId, null, control);
+    });
+
+    const runStreamWithFallback = async () => {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const turn = await runStreamTurn(activeModel, activeConfig === 'auto' ? null : activeConfig);
+        if (turn.aborted) return turn;
+        if (turn.fallback && turn.decision) {
+          const decision = turn.decision;
+          if (decision.raceModels && decision.raceModels.length) {
+            console.log(`[openai ${reqId}] Launching TIER RACE: ${decision.raceModels.join(', ')}`);
+            for (const raceModel of decision.raceModels) {
+              activeModel = raceModel;
+              activeConfig = raceModel;
+              const raceTurn = await runStreamTurn(raceModel, raceModel);
+              if (raceTurn.aborted) return raceTurn;
+              if (!raceTurn.fallback) return raceTurn;
+            }
+            const nextModels = getNextTierModels(resolveModelId(modelName), Object.keys(fallbackAttempted));
+            if (nextModels.length) {
+              activeModel = nextModels[0];
+              activeConfig = nextModels[0];
+              fallbackAttempted[activeModel] = true;
+              console.log(`[openai ${reqId}] Race exhausted, next tier: ${activeModel}`);
+              continue;
+            }
+            const fbModel = getFallbackModel();
+            if (fbModel && !fallbackAttempted[fbModel]) {
+              fallbackAttempted[fbModel] = true;
+              activeModel = fbModel;
+              activeConfig = fbModel;
+              console.log(`[openai ${reqId}] Race exhausted, fallback model: ${activeModel}`);
+              continue;
+            }
+            return turn;
+          }
+          if (decision.nextModel) {
+            activeModel = decision.nextModel;
+            activeConfig = decision.nextModel;
+            console.log(`[openai ${reqId}] Retrying stream with fallback model: ${activeModel}`);
+            continue;
+          }
+        }
+        return turn;
+      }
+      return {
+        fullContent: '',
+        fullReasoning: '',
+        finishReason: 'stop',
+        toolCalls: [],
+        modelUsed: activeModel,
+      };
     };
 
     try {
-      await startOne(activeModel, activeConfig === 'auto' ? null : activeConfig);
+      for (;;) {
+        const turn = await runStreamWithFallback();
+        if (turn.aborted) return settle({ modelUsed: activeStreamModel });
+
+        activeStreamModel = turn.modelUsed || activeModel;
+        if (turn.fullContent) aggregateContent += turn.fullContent;
+        if (turn.fullReasoning) {
+          aggregateReasoning = aggregateReasoning
+            ? `${aggregateReasoning}\n${turn.fullReasoning}`
+            : turn.fullReasoning;
+        }
+        if (turn.tokenUsage) lastTokenUsage = turn.tokenUsage;
+        if (turn.toolCalls && turn.toolCalls.length) {
+          lastToolCalls = [...lastToolCalls, ...turn.toolCalls];
+        }
+
+        const decision = shouldAutoContinue(turn, {
+          ...continueOptsBase,
+          continueCount,
+          lastShortText,
+        });
+
+        if (!decision.shouldContinue) {
+          let finalReason = turn.finishReason || 'stop';
+          if (decision.finishReason === 'length') finalReason = 'length';
+          if (decision.reason === 'cap_reached') {
+            console.log(`[openai ${reqId}] auto_continue cap (${continueCount}/${MAX_CONTINUES})`);
+            finalReason = 'length';
+          }
+          endStreamFinally(finalReason, activeStreamModel);
+          return;
+        }
+
+        console.log(
+          `[openai ${reqId}] auto_continue stream reason=${decision.reason} ` +
+          `(${continueCount + 1}/${MAX_CONTINUES})`
+        );
+        appendContinueTurn(messages, turn, decision.continueMessage);
+        if (decision.isShortResponse) {
+          lastShortText = (turn.fullContent || turn.textContent || '').trim();
+        }
+        continueCount++;
+      }
     } catch (e) {
       rejectOuter(e);
     }
@@ -2570,69 +2705,66 @@ app.post('/v1/messages', authenticate, async (req, res) => {
           const elapsed = Date.now() - startTime;
           console.log(`[anthropic ${reqId}] stream ended: ${elapsed}ms, stopReason=${streamState?.stopReason}, suppressStopEvents=${streamState?.suppressStopEvents}, continueCount=${continueCount}`);
 
-          // Check if we should auto-continue
-          if (AUTO_CONTINUE && streamState && streamState.messageStopped && isResponseTruncated(streamState) && continueCount < MAX_CONTINUES) {
-            const currentText = (streamState.textContent || '').trim();
-            const { textThreshold, similarityThreshold } = getTruncationSettings();
-            const isShortResponse = currentText.length < textThreshold;
+          // Unified auto-continue (same rules as OpenAI path)
+          if (streamState && streamState.messageStopped) {
+            let continueSettingsAnthro = {};
+            try {
+              continueSettingsAnthro = (getModelConfig() && getModelConfig().settings) || {};
+            } catch (e) { /* ignore */ }
+            const decision = shouldAutoContinue(streamState, {
+              enabled: AUTO_CONTINUE,
+              maxContinues: MAX_CONTINUES,
+              continueCount,
+              lastShortText,
+              settings: continueSettingsAnthro,
+            });
 
-            if (isShortResponse && lastShortText && currentText.length > 0) {
-              const overlap = Math.min(lastShortText.length, currentText.length);
-              let sameChars = 0;
-              for (let i = 0; i < overlap; i++) {
-                if (lastShortText[i] === currentText[i]) sameChars++;
+            if (decision.similarityStop) {
+              console.log(`[anthropic ${reqId}] Short response repeated, stopping auto-continue to avoid loop`);
+              if (streamState.suppressStopEvents && !res.writableEnded) {
+                const finalReason = streamState.hasToolUse ? 'tool_use' : (streamState.stopReason || 'end_turn');
+                sendEvent('message_delta', createAnthropicMessageDelta(finalReason, { output_tokens: streamState.outputTokenCount || 0 }));
+                sendEvent('message_stop', { type: 'message_stop' });
               }
-              const similarity = overlap > 0 ? sameChars / overlap : 0;
-              if (similarity > similarityThreshold) {
-                console.log(`[anthropic ${reqId}] Short response repeated (similarity=${(similarity*100).toFixed(0)}%), stopping auto-continue to avoid loop`);
-                if (streamState.messageStopped && streamState.suppressStopEvents && !res.writableEnded) {
-                  const finalReason = streamState.hasToolUse ? 'tool_use' : (streamState.stopReason || 'end_turn');
-                  sendEvent('message_delta', createAnthropicMessageDelta(finalReason, { output_tokens: streamState.outputTokenCount || 0 }));
-                  sendEvent('message_stop', { type: 'message_stop' });
-                }
-                break;
-              }
+              break;
             }
 
-            if (isShortResponse) {
-              lastShortText = currentText;
+            if (decision.shouldContinue && decision.continueMessage) {
+              continueCount++;
+              console.log(
+                `[anthropic ${reqId}] auto_continue reason=${decision.reason} ` +
+                `(${continueCount}/${MAX_CONTINUES}) stopReason=${streamState.stopReason}`
+              );
+              appendContinueTurn(currentMessages, streamState, decision.continueMessage);
+              if (decision.isShortResponse) {
+                lastShortText = (streamState.textContent || '').trim();
+              }
+
+              // Reset streamState for the next iteration
+              const savedContentBlockIndex = streamState.contentBlockIndex;
+              const savedMessageStarted = streamState.messageStarted;
+              const savedOutputTokenCount = streamState.outputTokenCount;
+
+              streamState = {
+                messageStarted: savedMessageStarted,
+                messageStopped: false,
+                contentBlockIndex: savedContentBlockIndex,
+                currentContentType: null,
+                textContent: '',
+                reasoningContent: '',
+                outputTokenCount: savedOutputTokenCount,
+                hasToolUse: false,
+                toolCallIndex: {},
+                toolCallBuffer: '',
+                inToolCall: false,
+                pendingToolCalls: [],
+                suppressStopEvents: true,
+                stopReason: null
+              };
+
+              // Don't send message_start again - just continue with content blocks
+              continue;
             }
-
-            continueCount++;
-            const isEmptyResponse = !streamState.textContent && !streamState.hasToolUse && (streamState.reasoningContent || '').length > 0;
-            const continueMsg = isEmptyResponse
-              ? 'Your previous response contained only thinking/reasoning with no actual output. Please provide your actual response now - either text content or a tool call.'
-              : '请继续输出，从你中断的地方继续。';
-            console.log(`[anthropic ${reqId}] ${isEmptyResponse ? 'Empty response (reasoning only)' : 'Response truncated'} (stopReason=${streamState.stopReason}), auto-continuing (${continueCount}/${MAX_CONTINUES})...`);
-
-            const assistantText = streamState.textContent || '';
-            currentMessages.push({ role: 'assistant', content: assistantText });
-            currentMessages.push({ role: 'user', content: continueMsg });
-
-            // Reset streamState for the next iteration
-            const savedContentBlockIndex = streamState.contentBlockIndex;
-            const savedMessageStarted = streamState.messageStarted;
-            const savedOutputTokenCount = streamState.outputTokenCount;
-
-            streamState = {
-              messageStarted: savedMessageStarted,
-              messageStopped: false,
-              contentBlockIndex: savedContentBlockIndex,
-              currentContentType: null,
-              textContent: '',
-              reasoningContent: '',
-              outputTokenCount: savedOutputTokenCount,
-              hasToolUse: false,
-              toolCallIndex: {},
-              toolCallBuffer: '',
-              inToolCall: false,
-              pendingToolCalls: [],
-              suppressStopEvents: true,
-              stopReason: null
-            };
-
-            // Don't send message_start again - just continue with content blocks
-            continue;
           }
 
           // Response is complete or max continues reached
