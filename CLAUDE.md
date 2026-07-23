@@ -32,4 +32,9 @@ Node.js (Express)、node-fetch、dotenv；无打包步骤。
 
 - 可用：解密 + `solo_work_lite` 对话 + OpenAI 排队降级 + 4001/4023 换模  
 - `model-config.json` 的 tiers/fallback **必须**是 SOLO `get_detail_param` 里真实 `config_name`（无 `glm-5.1` 等幽灵名）  
+- Think effort：`src/think-effort.js` + body `think_effort`；仅 `glm-5.2` / `DeepSeek-V4-Pro` / `kimi-k2.7-code`（见 `doc/think-effort.md`）  
 - 待做：完整 `create_agent_task` 对齐（`TODO.md` #1）
+
+---
+
+commit message 采用中文

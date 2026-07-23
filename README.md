@@ -17,7 +17,8 @@
 | OAuth | SOLO ClientID 默认 `en1oxy7wnw8j9n` |
 | 排队降级 | OpenAI `/v1/chat/completions` 也支持超阈值换模型 |
 | 模型表 | 补充 SOLO 侧模型/别名与 fallback |
-| 文档 | 短 README + `SOLO_PARITY.md` / `TODO.md`；去掉上游冗长进度/教程副本 |
+| Think effort | 按模型注入 reasoning-effort system 前缀；对外 `think_effort`（见下） |
+| 文档 | 短 README + `SOLO_PARITY.md` / `TODO.md` / `doc/think-effort.md` |
 
 > **排队**：Trae CN `chat_v3` 很重；SOLO `solo_work_lite` 较轻。默认按 SOLO。
 
@@ -70,12 +71,53 @@ claude
 
 Cursor/Cline：Base URL `http://localhost:19900/v1`，Key 同上，Model `auto` / `glm-5.2`。
 
+## Think effort（推理深度）
+
+SOLO `llm_utils_chat` **无**原生 `reasoning_effort`。本项目在发上游前，按模型族把**固定** reasoning 控制串 **prepend 到 system 顶部**（实验验证，见 `doc/think-effort.md`）。
+
+### 参数
+
+| 字段 | 说明 |
+|---|---|
+| `think_effort` | **主字段**（OpenAI `/v1/chat/completions`、Anthropic `/v1/messages` body） |
+| `reasoning_effort` | 别名 |
+
+取值：`auto`（默认，不注入）| `off` | `low` | `high` | `max`  
+不支持的模型/档位 → 静默不注入，请求仍成功。  
+换模/排队 fallback 时会按**新** `config_name` 重算前缀。
+
+能力查询：`GET /v1/think-effort`
+
+### 支持模型与档位
+
+| SOLO 模型 (`config_name`) | 支持的 `think_effort` | 注入策略（摘要） |
+|---|---|---|
+| `glm-5.2` | `high`, `max` | `Reasoning Effort: High` / `Max`（短标签；**不要**用 Absolute 长串） |
+| `DeepSeek-V4-Pro` | `max` | Absolute maximum **长串**（短 `Max` 无效） |
+| `kimi-k2.7-code` | `low`, `max` | `low` = `<critical_constraints>` 压 overthink；`max` = Absolute 长串加深 |
+
+其它模型（含 `auto`）：`think_effort` 忽略。
+
+### 示例
+
+```bash
+curl -s http://localhost:19900/v1/chat/completions \
+  -H "Authorization: Bearer trae-solo-local-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"DeepSeek-V4-Pro","think_effort":"max","messages":[{"role":"user","content":"findMin rotated array"}],"stream":false}'
+```
+
+日志应含：`[think_effort …] injected=yes`。
+
+细节与实验数据：`doc/think-effort.md`。复现 probe：`scripts/probe-reasoning-deepen.js`（测时关 autoFallback）。
+
 ## 目录
 
 ```text
-src/           服务与 Trae/SOLO 客户端
+src/           服务与 Trae/SOLO 客户端（含 think-effort.js）
 web/           Dashboard
-scripts/       模型拉取 / SOLO probe
+scripts/       模型拉取 / SOLO probe / think-effort probe
+doc/           设计与实验文档（think-effort.md）
 model-config.json
 SOLO_PARITY.md  对齐细节
 TODO.md         未完成项
@@ -91,6 +133,7 @@ TODO.md         未完成项
 | 解密失败 / 401 | 重登 SOLO 或 `TRAE_MANUAL_TOKEN` |
 | `Error 4001` param invalid | `config_name` 不在 SOLO `solo_work_lite` 目录。改用目录内模型（如 `glm-5.2` / `glm-5-turbo` / `DeepSeek-V4-Pro`）。`model-config.json` 已把幽灵别名映射到有效名；排队降级也会跳过 4001/4023 |
 | 排队后失败 | 阈值默认 50；降级链只含 SOLO 有效 `config_name`。改 `model-config.json` 的 `fallback` / tiers |
+| `think_effort` 无效果 | 仅三模型见上表；`auto`/`off` 不注入；看日志 `injected=yes/no`；fallback 换到不支持模型会 strip |
 
 同步官方模型表：`node scripts/dump-model-detail.js`（结果在 `output/`，已 gitignore）。
 
