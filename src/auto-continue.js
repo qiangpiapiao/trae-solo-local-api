@@ -73,6 +73,18 @@ function isLikelyTruncatedText(text) {
   const codeBlockOpens = (t.match(/```/g) || []).length;
   if (codeBlockOpens % 2 !== 0) return true;
 
+  // 未闭合的 <toolcall>/<tool_call> 标签 — 模型开始输出工具调用但被截断
+  // 只检查文本末尾附近（最后 500 字符），避免误判文本中间解释用法的标签
+  // （如 "你可以使用 <toolcall> 标签" 或代码示例中的标签字符串）
+  const tail = t.slice(-500);
+  const openTagIdx = tail.search(/<(?:tool_call|toolcall)(?:\s[^>]*)?>/i);
+  if (openTagIdx >= 0) {
+    // 末尾有开标签，检查这个开标签之后是否有对应的闭标签
+    const afterOpen = tail.slice(openTagIdx);
+    const hasClose = /<\/(?:tool_call|toolcall)>/i.test(afterOpen);
+    if (!hasClose) return true;
+  }
+
   const last100 = t.slice(-100).trim();
   const openBrackets = (last100.match(/[\[{(]/g) || []).length;
   const closeBrackets = (last100.match(/[\]})]/g) || []).length;
@@ -103,7 +115,8 @@ function isLikelyTruncatedText(text) {
  *   reasoning: string,
  *   hasToolUse: boolean,
  *   finishReason: string|null,
- *   messageStarted: boolean
+ *   messageStarted: boolean,
+ *   incompleteToolcall: boolean
  * }}
  */
 function normalizeTurnState(raw) {
@@ -114,6 +127,7 @@ function normalizeTurnState(raw) {
       hasToolUse: false,
       finishReason: null,
       messageStarted: false,
+      incompleteToolcall: false,
     };
   }
   const text = String(
@@ -141,7 +155,8 @@ function normalizeTurnState(raw) {
     raw.messageStarted !== undefined
       ? !!raw.messageStarted
       : !!(text || reasoning || hasToolUse);
-  return { text, reasoning, hasToolUse, finishReason, messageStarted };
+  const incompleteToolcall = !!raw.incompleteToolcall;
+  return { text, reasoning, hasToolUse, finishReason, messageStarted, incompleteToolcall };
 }
 
 function isMaxTokensReason(finishReason) {
@@ -188,6 +203,20 @@ function shouldAutoContinue(rawState, opts = {}) {
       continueMessage: null,
       finishReason: null,
       isShortResponse: false,
+      similarityStop: false,
+    };
+  }
+
+  // 确定性截断信号：流在 toolcall 中间结束（由流式解析器直接报告）
+  // 必须在 no_output 检查之前 — 不完整 toolcall 被丢弃后 fullContent 为空，
+  // 但这确实是截断而非无输出
+  if (state.incompleteToolcall) {
+    return {
+      shouldContinue: true,
+      reason: 'incomplete_toolcall',
+      continueMessage: MSG_TRUNCATED,
+      finishReason: null,
+      isShortResponse: true,
       similarityStop: false,
     };
   }

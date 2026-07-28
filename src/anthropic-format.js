@@ -1,20 +1,90 @@
 const { v4: uuidv4 } = require('./uuid');
 
+// Extract the first balanced JSON object from a string using brace-matching.
+// Properly handles braces inside string values (e.g. "}" inside a string won't count).
+// Returns the substring of the first complete {...}, or null if not found.
+function extractFirstJsonObject(str) {
+  const start = str.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < str.length; i++) {
+    const c = str[i];
+    if (escape) { escape = false; continue; }
+    if (inString) {
+      if (c === '\\') { escape = true; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return str.substring(start, i + 1);
+    }
+  }
+  return null;
+}
+
 // Parse function-call-style toolcall: funcName({"key":"value","key2":"value2"})
-// 也支持 funcName(key="value", key2="value2") 形式
+// 也支持 funcName(key="value", key2="value2") 和混合位置参数 funcName(arg1, arg2, key="val")
 // 模型有时生成 <tool_call>glob({"path":"...","pattern":"..."})</arg_value> 这类非标准格式
+// 也处理模型输出 write({...}} 缺少 ) 的情况
 function parseFunctionCallToolcall(inner) {
-  const trimmed = inner.trim();
+  let trimmed = inner.trim();
   if (!trimmed) return null;
-  // 形如 name({...})
-  const m = trimmed.match(/^([A-Za-z_][\w\-\.]*)\s*\(([\s\S]*)\)\s*$/);
-  if (!m) return null;
-  const name = m[1];
-  const argsRaw = m[2].trim();
+
+  // 通用预处理：在 funcName( 之前可能嵌套 <arg_key> 等标签
+  let candidateToolName = null;
+  const funcStart = trimmed.search(/[A-Za-z_][\w\-\.]*\s*\(/);
+  if (funcStart > 0) {
+    const prefix = trimmed.slice(0, funcStart);
+    const tagMatch = prefix.match(/([A-Za-z_][\w\-\.]*)\s*<[a-z_][\w\-]*>/i);
+    if (tagMatch) {
+      candidateToolName = tagMatch[1];
+      trimmed = trimmed.slice(funcStart);
+    }
+  } else if (funcStart < 0) {
+    const cleaned = trimmed.replace(/([A-Za-z_][\w\-\.]*)?\s*<[a-z_][\w\-]*>/gi, (match, ident) => {
+      if (ident && !candidateToolName) candidateToolName = ident;
+      return '';
+    }).trim();
+    if (cleaned !== trimmed) {
+      trimmed = cleaned;
+    }
+  }
+
+  // 尝试匹配 funcName(...) — 严格要求首尾配对
+  let m = trimmed.match(/^([A-Za-z_][\w\-\.]*)\s*\(([\s\S]*)\)\s*$/);
+  if (!m) {
+    // 松散匹配：funcName({...}  (缺少 ) — 模型常把 ) 写成 } 或遗漏)
+    const loose = trimmed.match(/^([A-Za-z_][\w\-\.]*)\s*\(([\s\S]*)$/);
+    if (loose) {
+      m = loose;
+    } else {
+      // 最后尝试：从文本中提取 funcName(...) 模式
+      const fallback = trimmed.match(/([A-Za-z_][\w\-\.]*)\s*\(([\s\S]*)\)\s*$/);
+      if (fallback) {
+        m = fallback;
+      } else {
+        return null;
+      }
+    }
+  }
+  let name = m[1];
+  let argsRaw = m[2].trim();
+  // 松散匹配时 argsRaw 可能有多余的尾部 } 或 )，用 brace-matching 提取完整 JSON
   if (!argsRaw) return { name, params: {} };
+
+  // 若 name 字面是 "name" 且有候选工具名，用候选工具名替换
+  if (name === 'name' && candidateToolName) {
+    name = candidateToolName;
+  }
 
   // 1) 尝试 JSON 解析
   if (argsRaw.startsWith('{')) {
+    // 1a) 直接 JSON.parse
     try {
       const params = JSON.parse(argsRaw);
       if (params && typeof params === 'object' && !Array.isArray(params)) {
@@ -23,23 +93,105 @@ function parseFunctionCallToolcall(inner) {
     } catch (e) {
       // JSON 解析失败，继续尝试其他方式
     }
-    // 尝试 lenient 提取（处理未转义引号）
-    const lenientResult = lenientExtractToolcall('{"name":"' + name + '","params":' + argsRaw + '}');
+    // 1b) 用 brace-matching 提取第一个完整 JSON 对象（处理 argsRaw 尾部多余的 } 或 ) ）
+    const jsonObj = extractFirstJsonObject(argsRaw);
+    if (jsonObj && jsonObj !== argsRaw) {
+      try {
+        const params = JSON.parse(jsonObj);
+        if (params && typeof params === 'object' && !Array.isArray(params)) {
+          return { name, params };
+        }
+      } catch (e) {}
+    }
+    // 1c) 尝试 lenient 提取（处理未转义引号）
+    const lenientResult = lenientExtractToolcall('{"name":"' + name + '","params":' + (jsonObj || argsRaw) + '}');
     if (lenientResult && lenientResult.params && Object.keys(lenientResult.params).length > 0) {
       return { name, params: lenientResult.params };
     }
   }
 
-  // 2) 尝试 key="value", key2="value2" 形式
+  // 2) 按逗号分割参数，区分位置参数和命名参数
+  //    用状态机分割，正确处理引号内的逗号
   const params = {};
-  const kvRegex = /(\w+)\s*=\s*"([^"]*?)"(?:\s*,\s*|\s*$)/g;
-  let kvMatch;
-  let kvCount = 0;
-  while ((kvMatch = kvRegex.exec(argsRaw)) !== null) {
-    params[kvMatch[1]] = kvMatch[2];
-    kvCount++;
+  const positional = [];
+  const argParts = [];
+  let cur = '';
+  let inQuote = false;
+  let quoteChar = '';
+  for (let i = 0; i < argsRaw.length; i++) {
+    const c = argsRaw[i];
+    if (inQuote) {
+      cur += c;
+      if (c === quoteChar) {
+        inQuote = false;
+      }
+    } else if (c === '"' || c === "'") {
+      inQuote = true;
+      quoteChar = c;
+      cur += c;
+    } else if (c === ',') {
+      argParts.push(cur.trim());
+      cur = '';
+    } else {
+      cur += c;
+    }
   }
-  if (kvCount > 0) return { name, params };
+  if (cur.trim()) argParts.push(cur.trim());
+
+  let namedCount = 0;
+  for (const part of argParts) {
+    // 命名参数：key="value" / key='value' / key=value（数字/布尔）
+    const kvMatch = part.match(/^(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^,]*))$/);
+    if (kvMatch) {
+      const key = kvMatch[1];
+      const val = kvMatch[2] != null ? kvMatch[2]
+        : (kvMatch[3] != null ? kvMatch[3]
+          : (kvMatch[4] != null ? kvMatch[4].trim() : ''));
+      params[key] = val;
+      namedCount++;
+    } else {
+      // 位置参数：只去掉配对的外层引号
+      let stripped = part;
+      if (stripped.length >= 2) {
+        const first = stripped[0];
+        const last = stripped[stripped.length - 1];
+        if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+          stripped = stripped.slice(1, -1);
+        }
+      }
+      positional.push(stripped);
+    }
+  }
+
+  // 3) 如果有命名参数，优先返回命名参数（位置参数作为 arg0/arg1 补充）
+  if (namedCount > 0 || positional.length > 0) {
+    // 常见工具的位置参数→key 映射（按工具名）
+    // 模型生成 read(CONTENT..., /path, offset=30) 时，位置参数应映射到 file_path
+    // 模型生成 bash(CONTENT..., adb ...) 时，位置参数应映射到 command
+    const POS_KEY_MAP = {
+      bash: ['command'],
+      sh: ['command'],
+      shell: ['command'],
+      exec: ['command'],
+      run: ['command'],
+      read: ['file_path', 'offset', 'limit'],
+      write: ['file_path', 'content'],
+      edit: ['file_path', 'old_string', 'new_string'],
+      glob: ['path', 'pattern'],
+      grep: ['pattern', 'path'],
+      list: ['path']
+    };
+    const posKeys = POS_KEY_MAP[name.toLowerCase()] || [];
+    let posIdx = 0; // 跳过 CONTENT... 后的位置参数索引
+    for (let i = 0; i < positional.length; i++) {
+      // 跳过 CONTENT... 占位符
+      if (/^CONTENT\.\.\.$/i.test(positional[i])) continue;
+      const key = posKeys[posIdx] || ('arg' + posIdx);
+      if (params[key] === undefined) params[key] = positional[i];
+      posIdx++;
+    }
+    if (Object.keys(params).length > 0) return { name, params };
+  }
 
   return null;
 }
@@ -79,13 +231,15 @@ function parseXmlAttributeToolcall(inner) {
 // Format: ToolName key</arg_key><arg_value>value</arg_value>key2</arg_key><arg_value>value2</arg_value>
 // Also handles: ToolName <arg_key>key</arg_key><arg_value>value</arg_value>
 function parseXmlArgKeyToolcall(inner) {
-  const nameMatch = inner.match(/^(\w+)\s+/);
+  // 允许工具名后跟空格或直接跟 <arg_key>（如 "bash<arg_key>command</arg_key>..."）
+  const nameMatch = inner.match(/^(\w+)(?:\s+|<)/);
   if (!nameMatch) return null;
   const name = nameMatch[1];
   const params = {};
 
-  // Pattern: key</arg_key><arg_value>value</arg_value> or <arg_key>key</arg_key><arg_value>value</arg_value>
-  const argRegex = /(?:<arg_key>)?(\w+)\s*<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g;
+  // Pattern: key</arg_key><arg_value>value</arg_value> 或 <arg_key>key</arg_key><arg_value>value</arg_value>
+  // 也处理 <tool_call>key</arg_key>value 这种标签混用情况
+  const argRegex = /(?:<arg_key>|<tool_call>)?(\w+)\s*<\/arg_key>\s*(?:<arg_value>)?([\s\S]*?)(?:<\/arg_value>|<arg_key>|<tool_call>|$)/g;
   let m;
   while ((m = argRegex.exec(inner)) !== null) {
     params[m[1]] = m[2].trim();
@@ -1264,5 +1418,6 @@ module.exports = {
   parseXmlNamedToolcall,
   parseXmlAttributeToolcall,
   parseXmlArgKeyToolcall,
-  parseToolcallContent
+  parseToolcallContent,
+  extractFirstJsonObject
 };

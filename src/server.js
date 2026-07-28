@@ -199,9 +199,11 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
 
   const holdFinish = !!(control && control.holdFinish);
 
+  let lastFlushIncompleteToolcall = false;
   const flushToolFilter = () => {
     try {
       const flushed = toolFilter.flush();
+      lastFlushIncompleteToolcall = !!flushed.wasIncompleteToolcall;
       if (flushed.emitText) {
         fullContent += flushed.emitText;
         writeTextDelta(flushed.emitText);
@@ -226,6 +228,7 @@ function handleLlmUtilsStream(responseBody, res, completionId, modelName, saveTo
       textContent: fullContent,
       reasoningContent: fullReasoning,
       stopReason: reason === 'tool_calls' ? 'tool_use' : (reason === 'length' ? 'max_tokens' : reason),
+      incompleteToolcall: lastFlushIncompleteToolcall,
     };
   };
 
@@ -1216,6 +1219,8 @@ function prepareOpenAIMessagesForTrae(messages, tools, reqId) {
       `- JSON must have "name" and "params"\n` +
       `- Use EXACT tool names from the list (case-sensitive)\n` +
       `- Do not wrap toolcall in markdown fences\n` +
+      `- NEVER use <arg_key>, <arg_value>, <tool_call>, or any XML tags for parameters\n` +
+      `- ALWAYS output a single <toolcall> tag containing valid JSON, nothing else\n` +
       `- After <tool_result>, continue until the user question is answered\n` +
       `Tools (${compactLines.length}): ${compactLines.join(', ')}\n` +
       `</toolcall_protocol>\n`;
@@ -2334,6 +2339,8 @@ app.post('/v1/messages', authenticate, async (req, res) => {
         `- JSON must have "name" and "params"\n` +
         `- Use EXACT tool names from the list (case-sensitive)\n` +
         `- Do not wrap toolcall in markdown fences\n` +
+        `- NEVER use <arg_key>, <arg_value>, <tool_call>, or any XML tags for parameters\n` +
+        `- ALWAYS output a single <toolcall> tag containing valid JSON, nothing else\n` +
         `- After tool results, continue until the user question is answered\n` +
         `Tools (${compactLines.length}): ${compactLines.join(', ')}\n` +
         `</toolcall_protocol>\n`;

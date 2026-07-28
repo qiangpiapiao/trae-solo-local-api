@@ -1,5 +1,30 @@
 const { v4: uuidv4 } = require('./uuid');
 
+// Extract the first balanced JSON object from a string using brace-matching.
+function extractFirstJsonObject(str) {
+  const start = str.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < str.length; i++) {
+    const c = str[i];
+    if (escape) { escape = false; continue; }
+    if (inString) {
+      if (c === '\\') { escape = true; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return str.substring(start, i + 1);
+    }
+  }
+  return null;
+}
+
 function createOpenAIChatCompletion(id, model, content, finishReason, reasoning, usage, toolCalls) {
   const message = {
     role: 'assistant',
@@ -328,7 +353,8 @@ function createOpenAIToolcallStreamFilter(parseToolcallContent) {
     buffer: '',
     inToolCall: false,
     finishedToolCalls: [],
-    toolCallIndex: 0
+    toolCallIndex: 0,
+    pendingToolName: null // <tool_call> 前紧邻的标识符（如 bash<tool_call>...）
   };
 
   function tryParseInner(inner) {
@@ -336,13 +362,18 @@ function createOpenAIToolcallStreamFilter(parseToolcallContent) {
       const parsed = typeof parseToolcallContent === 'function'
         ? parseToolcallContent(inner)
         : JSON.parse(String(inner).trim());
-      const name = parsed.name || parsed.tool || parsed.tool_name || '';
+      let name = parsed.name || parsed.tool || parsed.tool_name || '';
       let params = parsed.params != null ? parsed.params
         : (parsed.arguments != null ? parsed.arguments
           : (parsed.input != null ? parsed.input : parsed));
       if (params && typeof params === 'object' && params.name && params === parsed) {
         const { name: _n, tool: _t, tool_name: _tn, ...rest } = params;
         params = rest;
+      }
+      // 模型生成 name(CONTENT..., actual_args) 时，parsed.name 可能字面是 "name"
+      // 此时用 pendingToolName（<tool_call> 前的标识符）作为真实工具名
+      if ((!name || name === 'name') && state.pendingToolName) {
+        name = state.pendingToolName;
       }
       if (!name) return null;
       const tc = {
@@ -357,6 +388,36 @@ function createOpenAIToolcallStreamFilter(parseToolcallContent) {
       state.finishedToolCalls.push(tc);
       return tc;
     } catch (e) {
+      // Fallback: 用 brace-matching 从 inner 中直接提取 JSON 对象
+      // 处理 write({...}} 缺少 ) 或 ) 被替换为 } 等模型输出错误
+      const jsonObj = extractFirstJsonObject(inner);
+      if (jsonObj) {
+        try {
+          const params = JSON.parse(jsonObj);
+          if (params && typeof params === 'object' && !Array.isArray(params)) {
+            // 从 JSON 前的文本提取工具名 (如 write( )
+            const beforeJson = inner.substring(0, inner.indexOf(jsonObj)).trim();
+            const nameMatch = beforeJson.match(/([A-Za-z_][\w\-\.]*)\s*\(?$/);
+            let name = nameMatch ? nameMatch[1] : '';
+            if ((!name || name === 'name') && state.pendingToolName) {
+              name = state.pendingToolName;
+            }
+            if (name) {
+              const tc = {
+                index: state.toolCallIndex++,
+                id: `call_${uuidv4().replace(/-/g, '').slice(0, 24)}`,
+                type: 'function',
+                function: {
+                  name: String(name),
+                  arguments: JSON.stringify(params)
+                }
+              };
+              state.finishedToolCalls.push(tc);
+              return tc;
+            }
+          }
+        } catch (e2) {}
+      }
       console.error(`[openai-format] toolcall parse fail: ${e.message}`);
       return null;
     }
@@ -370,8 +431,9 @@ function createOpenAIToolcallStreamFilter(parseToolcallContent) {
 
     while (state.buffer.length > 0) {
       if (state.inToolCall) {
-        // 查找闭合标签：标准 </toolcall>/</tool_call> 或非标准 </arg_value>/</arg> 等
-        // 模型有时生成 <tool_call>glob({...})</arg_value> 这类不匹配的标签
+        // 查找闭合标签：标准 </toolcall>/</tool_call> 或非标准 </arg_value> 等
+        // 注意：</arg_value> 可能是参数值结束（XML 参数格式），也可能是 toolcall 闭合
+        // 这里先按闭合标签处理，parseXmlArgKeyToolcall 会从 inner 提取参数
         const closeRegex = /<\/(?:tool_call|toolcall|arg_value|arg|parameter|param|invoke)>/i;
         let closeIdx = -1;
         let closeLen = 0;
@@ -402,7 +464,19 @@ function createOpenAIToolcallStreamFilter(parseToolcallContent) {
         // look for start tag
         const m = state.buffer.match(/<(?:tool_call|toolcall)(?:\s[^>]*)?>/i);
         if (m && m.index != null) {
-          emitText += state.buffer.slice(0, m.index);
+          const beforeTag = state.buffer.slice(0, m.index);
+          // 检测 <tool_call> 前紧邻的标识符（如 bash<tool_call>...）
+          // 模型有时生成 "bash<tool_call>name(CONTENT..., cmd)" 这种格式
+          // beforeTag 尾部的标识符作为候选工具名
+          const tailIdMatch = beforeTag.match(/([A-Za-z_][\w\-\.]*)\s*$/);
+          if (tailIdMatch) {
+            state.pendingToolName = tailIdMatch[1];
+            // 把标识符从 emitText 里去掉（不输出给客户端）
+            emitText += beforeTag.slice(0, beforeTag.length - tailIdMatch[0].length);
+          } else {
+            state.pendingToolName = null;
+            emitText += beforeTag;
+          }
           state.buffer = state.buffer.slice(m.index);
           state.inToolCall = true;
           continue;
@@ -440,7 +514,7 @@ function createOpenAIToolcallStreamFilter(parseToolcallContent) {
         if (tc) {
           state.buffer = '';
           state.inToolCall = false;
-          return { emitText: '', finishedToolCalls: [tc] };
+          return { emitText: '', finishedToolCalls: [tc], wasIncompleteToolcall: false };
         }
       }
       // No JSON found or JSON parse failed — try parsing inner directly
@@ -449,21 +523,25 @@ function createOpenAIToolcallStreamFilter(parseToolcallContent) {
       if (tc) {
         state.buffer = '';
         state.inToolCall = false;
-        return { emitText: '', finishedToolCalls: [tc] };
+        return { emitText: '', finishedToolCalls: [tc], wasIncompleteToolcall: false };
       }
-      // Still no parseable toolcall — the <toolcall> was likely a literal string
-      // in the model's text (e.g. describing code), not a real tool call.
-      // Emit the original buffer as plain text so content is not lost.
-      console.warn('[openai-format] no parseable toolcall in buffer at stream end, emitting as text');
-      const leftover = state.buffer;
+      // Still no parseable toolcall — buffer 中只有不完整的 toolcall 标签
+      // 流在 toolcall 中间结束，这是确切的截断信号
       state.buffer = '';
       state.inToolCall = false;
-      return { emitText: leftover, finishedToolCalls: [] };
+      if (!inner.includes('{')) {
+        // 模型只输出了工具名（甚至更少）就被截断，丢弃不完整内容
+        console.warn(`[openai-format] incomplete toolcall at stream end (no JSON params), dropping: ${inner.substring(0, 80)}`);
+        return { emitText: '', finishedToolCalls: [], wasIncompleteToolcall: true };
+      }
+      // inner 包含 `{` 但解析失败 — JSON 被截断，作为文本输出保留内容
+      console.warn('[openai-format] no parseable toolcall in buffer at stream end, emitting as text');
+      return { emitText: state.buffer || inner, finishedToolCalls: [], wasIncompleteToolcall: true };
     }
     const leftover = state.buffer;
     state.buffer = '';
     state.inToolCall = false;
-    return { emitText: leftover, finishedToolCalls: [] };
+    return { emitText: leftover, finishedToolCalls: [], wasIncompleteToolcall: false };
   }
 
   return { feed, flush, state };
