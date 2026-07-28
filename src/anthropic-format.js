@@ -67,6 +67,128 @@ function parseXmlNamedToolcall(inner) {
   return { name, params };
 }
 
+// Parse XML tag-params style toolcall
+// Format: ToolName\n<param1>value1</param1>\n<param2>value2</param2>
+// The first non-empty line is the tool name, followed by <tag>value</tag> pairs.
+// Handles unclosed last tag (e.g. <limit>30 at stream end).
+function parseXmlTagParamsToolcall(inner) {
+  const trimmed = inner.trim();
+  if (!trimmed) return null;
+  // First non-empty line is the tool name
+  const lines = trimmed.split(/\r?\n/);
+  let nameLine = '';
+  let restStart = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i].trim();
+    if (l) {
+      // Tool name should be a simple identifier (allow / and - for qualified names)
+      if (/^[\w\/\-]+$/.test(l)) {
+        nameLine = l;
+        restStart = lines.slice(0, i + 1).join('\n').length;
+        break;
+      }
+      // If first non-empty line is not a bare identifier, abort
+      return null;
+    }
+  }
+  if (!nameLine) return null;
+
+  const rest = trimmed.slice(restStart).trim();
+  const params = {};
+
+  // Match <param>value</param> (closed tags)
+  const closedRegex = /<(\w+)>([\s\S]*?)<\/\1>/g;
+  let m;
+  while ((m = closedRegex.exec(rest)) !== null) {
+    params[m[1]] = m[2].trim();
+  }
+
+  // Match unclosed last tag: <param>value (no closing tag, e.g. stream truncation)
+  // Find all <tag> openings, check if each has a closing </tag> after it.
+  // If not, extract value from after opening to next '<' or end of string.
+  const openingRegex = /<(\w+)>/g;
+  let om;
+  while ((om = openingRegex.exec(rest)) !== null) {
+    const tagName = om[1];
+    if (params[tagName] !== undefined) continue; // already captured as closed
+    const tagStart = om.index + om[0].length;
+    const closingIdx = rest.indexOf(`</${tagName}>`, tagStart);
+    if (closingIdx === -1) {
+      // Unclosed — extract value from after opening to next '<' or end
+      const afterOpening = rest.slice(tagStart);
+      const nextLt = afterOpening.indexOf('<');
+      const value = nextLt >= 0 ? afterOpening.slice(0, nextLt).trim() : afterOpening.trim();
+      if (value) params[tagName] = value;
+    }
+  }
+
+  if (Object.keys(params).length === 0) return null;
+  return { name: nameLine, params };
+}
+
+// Lenient extraction for malformed JSON with unescaped quotes inside string values.
+// Models sometimes generate: {"name":"bash","params":{"command":"node -e "code""}}
+// where the " around code are not escaped as \", breaking JSON.parse.
+// This function extracts name + params using tolerant regex with lookahead.
+function lenientExtractToolcall(inner) {
+  const trimmed = inner.trim();
+
+  const nameMatch = trimmed.match(/"name"\s*:\s*"([^"]+)"/);
+  if (!nameMatch) return null;
+  const name = nameMatch[1];
+
+  const params = {};
+
+  // Unescape common JSON escape sequences in captured values
+  const unescape = (s) => s
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t')
+    .replace(/\\r/g, '\r')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\');
+
+  // Find "params":{...} section
+  const paramsIdx = trimmed.search(/"params"\s*:\s*\{/);
+  if (paramsIdx >= 0) {
+    const braceStart = trimmed.indexOf('{', paramsIdx + 9);
+    if (braceStart >= 0) {
+      const paramsSection = trimmed.slice(braceStart);
+
+      // Match string values: "key":"value"
+      // Value extends until: " followed by ,"nextkey": OR " followed by } (end of params object)
+      // This tolerates unescaped " inside the value (e.g. node -e "code")
+      const strRegex = /"(\w+)"\s*:\s*"([\s\S]*?)(?="\s*,\s*"\w+"\s*:|"\s*\})/g;
+      let m;
+      while ((m = strRegex.exec(paramsSection)) !== null) {
+        params[m[1]] = unescape(m[2]);
+      }
+
+      // Match non-string values: "key":number/boolean/null
+      const numRegex = /"(\w+)"\s*:\s*(\d+(?:\.\d+)?|true|false|null)/g;
+      while ((m = numRegex.exec(paramsSection)) !== null) {
+        if (params[m[1]] === undefined) {
+          let val = m[2];
+          if (val === 'true') val = true;
+          else if (val === 'false') val = false;
+          else if (val === 'null') val = null;
+          else val = Number(val);
+          params[m[1]] = val;
+        }
+      }
+    }
+  } else {
+    // No params wrapper — extract top-level string fields besides "name"
+    const strRegex = /"(?!name"\s*:)(\w+)"\s*:\s*"([\s\S]*?)(?="\s*,\s*"\w+"\s*:|"\s*\})/g;
+    let m;
+    while ((m = strRegex.exec(trimmed)) !== null) {
+      params[m[1]] = unescape(m[2]);
+    }
+  }
+
+  if (Object.keys(params).length === 0) return null;
+  return { name, params };
+}
+
 function parseToolcallContent(inner) {
   const trimmed = inner.trim();
 
@@ -98,7 +220,25 @@ function parseToolcallContent(inner) {
     return attrResult;
   }
 
-  // 5. Try fixing common JSON issues (trailing commas, single quotes)
+  // 5. Try lenient extraction for malformed JSON with unescaped quotes
+  //    (e.g. model puts node -e "code" without escaping inner quotes)
+  if (trimmed.startsWith('{')) {
+    const lenientResult = lenientExtractToolcall(inner);
+    if (lenientResult) {
+      console.log(`[anthropic-format] Parsed lenient toolcall: ${lenientResult.name}`);
+      return lenientResult;
+    }
+  }
+
+  // 5b. Try XML tag-params format: ToolName\n<param>value</param>\n<param2>value2</param2>
+  //     (model uses XML tags for params instead of JSON, common with glm models)
+  const tagParamsResult = parseXmlTagParamsToolcall(inner);
+  if (tagParamsResult) {
+    console.log(`[anthropic-format] Parsed XML tag-params toolcall: ${tagParamsResult.name}`);
+    return tagParamsResult;
+  }
+
+  // 6. Try fixing common JSON issues (trailing commas, single quotes)
   if (trimmed.startsWith('{')) {
     try {
       const fixed = trimmed.replace(/,\s*([}\]])/g, '$1').replace(/'/g, '"');
@@ -106,7 +246,7 @@ function parseToolcallContent(inner) {
     } catch (e2) {}
   }
 
-  // 6. Try extracting JSON from mixed content
+  // 7. Try extracting JSON from mixed content
   const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     try {
@@ -782,12 +922,14 @@ function llmUtilsChunkToAnthropic(chunk, messageId, model, state, toolMap) {
         // <toolcall>/<tool_call> was opened but closing tag never arrived (e.g. max_tokens truncation)
         // Try to extract tool call from the incomplete buffer
         const bufferContent = state.toolCallBuffer.trim();
+        let recoveredAsToolCall = false;
         try {
           const toolData = JSON.parse(bufferContent);
           state.pendingToolCalls.push({
             name: toolData.name || toolData.function?.name || '',
             input: toolData.params || toolData.arguments || toolData.input || {}
           });
+          recoveredAsToolCall = true;
           console.log(`[anthropic-format] Recovered incomplete toolcall from buffer: ${toolData.name}`);
         } catch (e) {
           // Buffer is not valid JSON on its own - try to find JSON in it
@@ -799,11 +941,64 @@ function llmUtilsChunkToAnthropic(chunk, messageId, model, state, toolMap) {
                 name: toolData.name || toolData.function?.name || '',
                 input: toolData.params || toolData.arguments || toolData.input || {}
               });
+              recoveredAsToolCall = true;
               console.log(`[anthropic-format] Recovered toolcall from partial buffer: ${toolData.name}`);
             } catch (e2) {
-              console.warn(`[anthropic-format] Could not parse incomplete toolcall buffer, discarding: ${bufferContent.substring(0, 100)}`);
+              // Not JSON — try full parseToolcallContent (handles XML tag-params etc.)
+              try {
+                const toolData = parseToolcallContent(bufferContent);
+                state.pendingToolCalls.push({
+                  name: toolData.name || toolData.function?.name || '',
+                  input: toolData.params || toolData.arguments || toolData.input || {}
+                });
+                recoveredAsToolCall = true;
+                console.log(`[anthropic-format] Recovered toolcall via parseToolcallContent: ${toolData.name}`);
+              } catch (e3) {
+                // Not a real toolcall — likely a literal <toolcall> string in model text
+              }
+            }
+          } else {
+            // No JSON at all — try full parseToolcallContent (handles XML tag-params etc.)
+            try {
+              const toolData = parseToolcallContent(bufferContent);
+              state.pendingToolCalls.push({
+                name: toolData.name || toolData.function?.name || '',
+                input: toolData.params || toolData.arguments || toolData.input || {}
+              });
+              recoveredAsToolCall = true;
+              console.log(`[anthropic-format] Recovered toolcall via parseToolcallContent: ${toolData.name}`);
+            } catch (e3) {
+              // Not a real toolcall — likely a literal <toolcall> string in model text
             }
           }
+        }
+        if (!recoveredAsToolCall) {
+          // No parseable JSON — the <toolcall> was likely a literal string in
+          // the model's text (e.g. describing code), not a real tool call.
+          // Emit the original buffer as plain text so content is not lost.
+          console.warn(`[anthropic-format] no JSON in toolcall buffer at stream end, emitting as text: ${bufferContent.substring(0, 100)}`);
+          const remaining = state.toolCallBuffer;
+          if (state.currentContentType !== 'text') {
+            if (state.contentBlockIndex >= 0) {
+              events.push({
+                event: 'content_block_stop',
+                data: createAnthropicStreamEvent('content_block_stop', { index: state.contentBlockIndex })
+              });
+            }
+            state.contentBlockIndex++;
+            state.currentContentType = 'text';
+            events.push({
+              event: 'content_block_start',
+              data: createAnthropicContentBlockStart(state.contentBlockIndex, 'text', { text: '' })
+            });
+          }
+          events.push({
+            event: 'content_block_delta',
+            data: createAnthropicContentBlockDelta(state.contentBlockIndex, {
+              type: 'text_delta',
+              text: remaining
+            })
+          });
         }
         state.inToolCall = false;
         state.toolCallBuffer = '';
