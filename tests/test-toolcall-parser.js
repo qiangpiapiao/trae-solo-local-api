@@ -58,6 +58,19 @@ const testCases = [
     input: '{"name":"bash","command":"echo "hello world""}',
     expect: { name: 'bash', params: { command: 'echo "hello world"' } }
   },
+  // Format 10: Function-call syntax — funcName({"key":"value"})
+  // 模型生成 <tool_call>glob({"path":"...","pattern":"..."})</arg_value>
+  {
+    name: 'F10-func-call-json',
+    input: 'glob({"path":"C:\\\\Codes\\\\unapk\\\\projects\\\\rcs","pattern":"jadx_go_out"})',
+    expect: { name: 'glob', params: { path: 'C:\\Codes\\unapk\\projects\\rcs', pattern: 'jadx_go_out' } }
+  },
+  // Format 11: Function-call syntax — funcName(key="value", key2="value2")
+  {
+    name: 'F11-func-call-kv',
+    input: 'glob(path="C:\\\\Codes\\\\unapk\\\\projects\\\\rcs", pattern="jadx_go_out")',
+    expect: { name: 'glob', params: { path: 'C:\\\\Codes\\\\unapk\\\\projects\\\\rcs', pattern: 'jadx_go_out' } }
+  },
 ];
 
 console.log('=== Toolcall Parser Unit Test ===\n');

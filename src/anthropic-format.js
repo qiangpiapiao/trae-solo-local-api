@@ -1,5 +1,49 @@
 const { v4: uuidv4 } = require('./uuid');
 
+// Parse function-call-style toolcall: funcName({"key":"value","key2":"value2"})
+// 也支持 funcName(key="value", key2="value2") 形式
+// 模型有时生成 <tool_call>glob({"path":"...","pattern":"..."})</arg_value> 这类非标准格式
+function parseFunctionCallToolcall(inner) {
+  const trimmed = inner.trim();
+  if (!trimmed) return null;
+  // 形如 name({...})
+  const m = trimmed.match(/^([A-Za-z_][\w\-\.]*)\s*\(([\s\S]*)\)\s*$/);
+  if (!m) return null;
+  const name = m[1];
+  const argsRaw = m[2].trim();
+  if (!argsRaw) return { name, params: {} };
+
+  // 1) 尝试 JSON 解析
+  if (argsRaw.startsWith('{')) {
+    try {
+      const params = JSON.parse(argsRaw);
+      if (params && typeof params === 'object' && !Array.isArray(params)) {
+        return { name, params };
+      }
+    } catch (e) {
+      // JSON 解析失败，继续尝试其他方式
+    }
+    // 尝试 lenient 提取（处理未转义引号）
+    const lenientResult = lenientExtractToolcall('{"name":"' + name + '","params":' + argsRaw + '}');
+    if (lenientResult && lenientResult.params && Object.keys(lenientResult.params).length > 0) {
+      return { name, params: lenientResult.params };
+    }
+  }
+
+  // 2) 尝试 key="value", key2="value2" 形式
+  const params = {};
+  const kvRegex = /(\w+)\s*=\s*"([^"]*?)"(?:\s*,\s*|\s*$)/g;
+  let kvMatch;
+  let kvCount = 0;
+  while ((kvMatch = kvRegex.exec(argsRaw)) !== null) {
+    params[kvMatch[1]] = kvMatch[2];
+    kvCount++;
+  }
+  if (kvCount > 0) return { name, params };
+
+  return null;
+}
+
 // Parse XML attribute-style toolcall: ToolName key="value" key2="value2"
 function parseXmlAttributeToolcall(inner) {
   // Match: ToolName key="value" key2="value2" (last value may be missing closing quote)
@@ -236,6 +280,14 @@ function parseToolcallContent(inner) {
   if (tagParamsResult) {
     console.log(`[anthropic-format] Parsed XML tag-params toolcall: ${tagParamsResult.name}`);
     return tagParamsResult;
+  }
+
+  // 5c. Try function-call format: funcName({"key":"value"}) 或 funcName(key="value")
+  //     (模型有时生成 <tool_call>glob({"path":"..."})</arg_value> 这类非标准格式)
+  const funcCallResult = parseFunctionCallToolcall(inner);
+  if (funcCallResult) {
+    console.log(`[anthropic-format] Parsed function-call toolcall: ${funcCallResult.name}`);
+    return funcCallResult;
   }
 
   // 6. Try fixing common JSON issues (trailing commas, single quotes)

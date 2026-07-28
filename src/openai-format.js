@@ -370,28 +370,18 @@ function createOpenAIToolcallStreamFilter(parseToolcallContent) {
 
     while (state.buffer.length > 0) {
       if (state.inToolCall) {
-        let closeIdx = state.buffer.toLowerCase().indexOf('</toolcall>');
-        let closeLen = '</toolcall>'.length;
-        let closeToken = '</toolcall>';
-        const alt = state.buffer.toLowerCase().indexOf('</tool_call>');
-        if (closeIdx < 0 || (alt >= 0 && alt < closeIdx)) {
-          if (alt >= 0) {
-            closeIdx = alt;
-            closeLen = '</tool_call>'.length;
-            closeToken = '</tool_call>';
-          }
-        }
-        // find actual case-sensitive slice length from buffer
-        if (closeIdx >= 0) {
-          // re-find with original case using regex
-          const cm = state.buffer.match(/<\/(?:tool_call|toolcall)>/i);
-          if (cm && cm.index != null) {
-            closeIdx = cm.index;
-            closeLen = cm[0].length;
-          }
+        // 查找闭合标签：标准 </toolcall>/</tool_call> 或非标准 </arg_value>/</arg> 等
+        // 模型有时生成 <tool_call>glob({...})</arg_value> 这类不匹配的标签
+        const closeRegex = /<\/(?:tool_call|toolcall|arg_value|arg|parameter|param|invoke)>/i;
+        let closeIdx = -1;
+        let closeLen = 0;
+        const cm = state.buffer.match(closeRegex);
+        if (cm && cm.index != null) {
+          closeIdx = cm.index;
+          closeLen = cm[0].length;
         }
         if (closeIdx < 0) {
-          // still open — wait for more, avoid unbounded buffer
+          // 仍然打开 — 等待更多数据，避免无界缓冲
           if (state.buffer.length > 200000) {
             emitText += state.buffer;
             state.buffer = '';
