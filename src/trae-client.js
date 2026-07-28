@@ -46,13 +46,18 @@ let fallbackConfig = { autoFallback: true, queueThreshold: 500, mappings: {} };
 
 function loadFallbackConfig() {
   try {
+    // model-config.json 的 fallback 字段作为默认基础
+    const baseFromModelConfig = (modelConfig.fallback && Object.keys(modelConfig.fallback).length > 0)
+      ? { ...modelConfig.fallback }
+      : {};
+    let fileConfig = {};
     if (fs.existsSync(FALLBACK_CONFIG_PATH)) {
       const raw = fs.readFileSync(FALLBACK_CONFIG_PATH, 'utf-8');
-      fallbackConfig = JSON.parse(raw);
+      fileConfig = JSON.parse(raw);
     }
-    if (modelConfig.fallback && Object.keys(modelConfig.fallback).length > 0) {
-      fallbackConfig = { ...fallbackConfig, ...modelConfig.fallback };
-    }
+    // 文件优先级高于 model-config.json：文件值覆盖基础值
+    // 这样 dashboard 修改 autoFallback=false 后不会被 model-config.json 的 true 覆盖
+    fallbackConfig = { ...baseFromModelConfig, ...fileConfig };
   } catch (e) {
     console.error('[fallback] Failed to load config:', e.message);
   }
