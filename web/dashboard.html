@@ -116,6 +116,16 @@ body {
 .status-bar .item .val { color: var(--text); font-weight: 500; }
 .status-bar .item .val.green { color: var(--green); }
 .status-bar .item .val.blue { color: var(--accent); }
+.status-bar .channel-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 500;
+  margin-right: 6px; border: 1px solid var(--border);
+}
+.status-bar .channel-badge.ok { background: rgba(76, 175, 80, 0.15); color: var(--green); border-color: var(--green); }
+.status-bar .channel-badge.warn { background: rgba(255, 193, 7, 0.15); color: #ffc107; border-color: #ffc107; }
+.status-bar .channel-badge.err { background: rgba(244, 67, 54, 0.15); color: var(--red); border-color: var(--red); }
+.status-bar .channel-badge.muted { background: var(--bg-panel); color: var(--text-muted); }
+.status-bar .channel-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
 /* Row Layout */
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
@@ -451,6 +461,7 @@ tr:hover td { background: var(--table-hover); }
 
 <!-- Status Bar -->
 <div class="status-bar">
+  <div class="item"><span class="key">Channels:</span><span id="statusEditions">-</span></div>
   <div class="item"><span class="key">Auto-Continue:</span><span class="val green" id="statusAuto">-</span></div>
   <div class="item"><span class="key">Max Continues:</span><span class="val" id="statusMaxContinue">-</span></div>
   <div class="item"><span class="key">Port:</span><span class="val" id="statusPort">-</span></div>
@@ -768,6 +779,32 @@ async function refreshStatus() {
   document.getElementById('statusWorkspace').textContent = data.workspaceDir || '-';
   document.getElementById('statusSync').textContent = data.outputSyncDir || '-';
   document.getElementById('statusDot').className = 'status-dot online';
+
+  // 渲染渠道状态 badges
+  const editionsEl = document.getElementById('statusEditions');
+  if (editionsEl) {
+    const eds = data.editions || {};
+    const labels = { cn: 'TraeCN', sg: 'Trae' };
+    const html = ['cn', 'sg'].map(ed => {
+      const info = eds[ed] || {};
+      const label = labels[ed] || ed.toUpperCase();
+      let cls = 'muted', text = `${label} 未安装`;
+      if (info.available) {
+        if (info.loggedIn && info.tokenValid) {
+          cls = 'ok';
+          text = `${label} 可用`;
+        } else if (info.loggedIn && !info.tokenValid) {
+          cls = 'warn';
+          text = `${label} token过期`;
+        } else {
+          cls = 'err';
+          text = `${label} 未登录`;
+        }
+      }
+      return `<span class="channel-badge ${cls}"><span class="dot"></span>${text}</span>`;
+    }).join('');
+    editionsEl.innerHTML = html;
+  }
 }
 
 async function refreshSessions() {

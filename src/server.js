@@ -6,7 +6,7 @@ require('dotenv').config();
 
 const PACKAGE_VERSION = require('../package.json').version;
 
-const { getAuthInfo, getDeviceIds, isTokenExpired, getApiHost, refreshTokenIfNeeded, detectEdition } = require('./auth');
+const { getAuthInfo, getDeviceIds, isTokenExpired, getApiHost, refreshTokenIfNeeded, detectEdition, getEditionStatus } = require('./auth');
 const { llmUtilsChat, chatCompletion, createAgentTask, getModelDetailParam, getChatModes, resolveModelId, MODEL_MAP, REVERSE_MODEL_MAP, FUNCTION_MAP, getFallbackConfig, saveFallbackConfig, getFallbackChain, getRaceModels, isRaceFallbackEnabled, getTiers, getModelsInTier, getTierOfModel, isTieredFallbackEnabled, isRaceWithinTierEnabled, getFallbackModel, getSameTierModels, getNextTierModels, findMultimodalModel, getModelConfig, saveModelConfig, rebuildDerivedMaps } = require('./trae-client');
 const { createOpenAIChatCompletion, createOpenAIStreamChunk, createOpenAIModels, parseLlmUtilsChatStream, llmUtilsChunkToOpenAI, parseAgentTaskStream, parseTraeStreamChunk, traeChunkToOpenAI, extractToolcallsFromText, createOpenAIToolcallStreamFilter, buildOpenAIToolCallStreamDeltas } = require('./openai-format');
 const {
@@ -2039,6 +2039,8 @@ function sanitizeWorkspace(ws) {
 app.get('/v1/dashboard/status', authenticate, (req, res) => {
   const uptime = Date.now() - serverStartTime;
   const uptimeStr = `${Math.floor(uptime / 3600000)}h ${Math.floor((uptime % 3600000) / 60000)}m ${Math.floor((uptime % 60000) / 1000)}s`;
+  let editions = null;
+  try { editions = getEditionStatus(); } catch (e) {}
   res.json({
     name: 'Trae Local API',
     version: PACKAGE_VERSION,
@@ -2050,7 +2052,8 @@ app.get('/v1/dashboard/status', authenticate, (req, res) => {
     autoContinue: AUTO_CONTINUE,
     maxContinues: MAX_CONTINUES,
     workspaceDir: WORKSPACE_DIR,
-    outputSyncDir: OUTPUT_SYNC_DIR
+    outputSyncDir: OUTPUT_SYNC_DIR,
+    editions: editions
   });
 });
 

@@ -1,0 +1,34 @@
+{
+  "_comment": "模型→edition 路由映射。请求按模型名匹配（支持 * 通配符），决定用哪个 edition 的 token+host。优先级：精确名 > 通配符 > 默认 edition。匹配不到时走 TRAE_EDITION 环境变量或自动检测。",
+  "default": "auto",
+  "mappings": {
+    "sg": [
+      "gpt-*",
+      "gpt",
+      "o1",
+      "o1-*",
+      "o3",
+      "o3-*",
+      "claude-*",
+      "claude",
+      "gemini-*",
+      "gemini",
+      "llama-*",
+      "mistral-*",
+      "mixtral-*"
+    ],
+    "cn": [
+      "glm-*",
+      "glm",
+      "qwen-*",
+      "qwen",
+      "deepseek-*",
+      "deepseek",
+      "kimi-*",
+      "kimi",
+      "doubao-*",
+      "doubao",
+      "moonshot-*"
+    ]
+  }
+}

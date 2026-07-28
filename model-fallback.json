@@ -1,66 +1,92 @@
 {
-  "autoFallback": true,
-  "queueThreshold": 300,
+  "autoFallback": false,
+  "queueThreshold": 50,
   "mappings": {
     "claude-sonnet-4-6": [
-      "glm-5.1",
+      "glm-5-turbo",
       "glm-5",
-      "qwen-3.6-plus"
+      "qwen-3.7-plus"
     ],
     "claude-opus-4-7": [
-      "glm-5.1",
-      "qwen-3.6-plus",
+      "glm-5-turbo",
+      "qwen-3.7-plus",
       "glm-5"
     ],
     "claude-opus-4-6": [
-      "glm-5.1",
-      "qwen-3.6-plus",
+      "glm-5-turbo",
+      "qwen-3.7-plus",
       "glm-5"
     ],
     "claude-opus-4-5": [
-      "glm-5.1",
-      "qwen-3.6-plus",
+      "glm-5-turbo",
+      "qwen-3.7-plus",
       "Doubao-Seed-2.0-Code"
     ],
     "claude-opus-4-5-20251101": [
-      "glm-5.1",
-      "qwen-3.6-plus",
+      "glm-5-turbo",
+      "qwen-3.7-plus",
       "Doubao-Seed-2.0-Code"
     ],
     "claude-sonnet-4-5": [
-      "glm-5.1",
+      "glm-5-turbo",
       "glm-5",
-      "qwen-3.6-plus"
+      "qwen-3.7-plus"
     ],
     "claude-sonnet-4-5-20250929": [
-      "glm-5.1",
+      "glm-5-turbo",
       "glm-5",
-      "qwen-3.6-plus"
+      "qwen-3.7-plus"
     ],
     "claude-3.7-sonnet": [
-      "glm-5.1",
+      "glm-5-turbo",
       "glm-5",
-      "qwen-3.5"
+      "qwen-3.7-plus"
     ],
     "claude-3.5-sonnet": [
-      "glm-5.1",
+      "glm-5-turbo",
       "glm-5",
-      "qwen-3.5"
+      "qwen-3.7-plus"
     ],
     "claude-sonnet-4": [
-      "glm-5.1",
+      "glm-5-turbo",
       "glm-5",
-      "qwen-3.5"
+      "qwen-3.7-plus"
     ],
     "claude-haiku-4-5": [
       "glm-5",
-      "qwen-3.6-plus",
-      "minimax-m2.7"
+      "qwen-3.7-plus",
+      "minimax-m3"
     ],
     "claude-haiku-4-5-20251001": [
       "glm-5",
-      "qwen-3.6-plus",
-      "minimax-m2.7"
+      "qwen-3.7-plus",
+      "minimax-m3"
+    ],
+    "glm-5.2": [
+      "glm-5-turbo",
+      "qwen-3.7-plus",
+      "Doubao-Seed-2.0-Code"
+    ],
+    "glm-5.1": [
+      "glm-5-turbo",
+      "glm-5",
+      "Doubao-Seed-2.0-Code"
+    ],
+    "DeepSeek-V4-Pro": [
+      "DeepSeek-V4-Flash",
+      "glm-5-turbo",
+      "glm-5",
+      "Doubao-Seed-2.0-Code"
+    ],
+    "DeepSeek-V4-Flash": [
+      "glm-5",
+      "Doubao-Seed-2.0-Code",
+      "minimax-m3"
+    ],
+    "glm-5-turbo": [
+      "glm-5",
+      "DeepSeek-V4-Flash",
+      "Doubao-Seed-2.0-Code"
     ]
   }
 }

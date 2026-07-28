@@ -3,7 +3,8 @@ const { v4: uuidv4 } = require('./uuid');
 const {
   getAuthInfo, getDeviceIds, getApiHost, buildCommonHeaders,
   buildStreamHeaders, isTokenExpired, refreshTokenIfNeeded,
-  detectEdition, getDeviceInfo, getIdeVersion, getIdeVersionCode
+  detectEdition, getDeviceInfo, getIdeVersion, getIdeVersionCode,
+  resolveEditionForModel
 } = require('./auth');
 const trafficLogger = require('./traffic-logger');
 const fs = require('fs');
@@ -387,17 +388,19 @@ function findMultimodalModel(configName) {
   return null;
 }
 
-async function ensureAuth() {
-  const authInfo = await refreshTokenIfNeeded();
+async function ensureAuth(model) {
+  // 按模型路由 edition：CN/SG 双版本同时使用时，根据请求的 model 选 token + host
+  const edition = resolveEditionForModel(model) || undefined;
+  const authInfo = await refreshTokenIfNeeded(edition);
   const deviceIds = getDeviceIds();
-  const apiHost = getApiHost();
+  const apiHost = getApiHost(edition);
   const headers = buildCommonHeaders(authInfo, deviceIds);
-  return { authInfo, deviceIds, apiHost, headers };
+  return { authInfo, deviceIds, apiHost, headers, edition };
 }
 
 async function llmUtilsChat(messages, model, stream, options) {
   return retryWithBackoff(async () => {
-    const { authInfo, deviceIds, apiHost } = await ensureAuth();
+    const { authInfo, deviceIds, apiHost } = await ensureAuth(model);
 
     const modelOpts = resolveModelOptions(model);
     const funcName = options?.function || modelOpts.function || 'inline_chat';
@@ -526,8 +529,8 @@ async function llmUtilsChat(messages, model, stream, options) {
   });
 }
 
-async function getModelDetailParam(functionName) {
-  const { headers, apiHost } = await ensureAuth();
+async function getModelDetailParam(functionName, model) {
+  const { headers, apiHost } = await ensureAuth(model);
   const body = {
     function: functionName || 'chat_v3',
     config_names: null,
@@ -567,20 +570,23 @@ function generateId() {
 }
 
 // Cache SOLO model detail configs (encrypted_model_params etc.)
-let _modelDetailCache = { at: 0, byFunction: {} };
-async function getModelConfigForFunction(functionName, configName) {
+// 按 edition+function 分桶缓存，避免双版本同时使用时混淆
+let _modelDetailCache = { at: 0, byBucket: {} };
+async function getModelConfigForFunction(functionName, configName, model) {
   const fn = functionName || getDefaultAgentFunction();
+  const edition = resolveEditionForModel(model) || detectEdition() || 'default';
   const now = Date.now();
-  if (!_modelDetailCache.byFunction[fn] || now - _modelDetailCache.at > 10 * 60 * 1000) {
+  if (!_modelDetailCache.byBucket[edition] || !_modelDetailCache.byBucket[edition][fn] || now - _modelDetailCache.at > 10 * 60 * 1000) {
     try {
-      const detail = await getModelDetailParam(fn);
-      _modelDetailCache.byFunction[fn] = detail;
+      const detail = await getModelDetailParam(fn, model);
+      _modelDetailCache.byBucket[edition] = _modelDetailCache.byBucket[edition] || {};
+      _modelDetailCache.byBucket[edition][fn] = detail;
       _modelDetailCache.at = now;
     } catch (e) {
       console.error('[model-detail] fetch failed:', e.message);
     }
   }
-  const detail = _modelDetailCache.byFunction[fn];
+  const detail = _modelDetailCache.byBucket[edition]?.[fn];
   const list = detail?.config_info_list || [];
   if (!configName) return list[0] || null;
   return list.find(x => x.config_name === configName || x.config_name === configName?.toLowerCase())
@@ -589,7 +595,7 @@ async function getModelConfigForFunction(functionName, configName) {
 }
 
 async function createAgentTask(messages, model, stream, options) {
-  const { authInfo, deviceIds, apiHost } = await ensureAuth();
+  const { authInfo, deviceIds, apiHost } = await ensureAuth(model);
   const modelOpts = resolveModelOptions(model, options?.config_name);
   const configName = options?.config_name || modelOpts.config_name || resolveModelId(model);
   const agentFunction = options?.function || options?.agent_type || modelOpts.function || getDefaultAgentFunction();
@@ -623,7 +629,7 @@ async function createAgentTask(messages, model, stream, options) {
   let modelCfg = null;
   let modelDetail = null;
   try {
-    modelCfg = await getModelConfigForFunction(agentType, configName);
+    modelCfg = await getModelConfigForFunction(agentType, configName, model);
     modelDetail = modelCfg?.model_detail_list?.[0] || null;
   } catch (e) {}
 
@@ -758,7 +764,7 @@ async function createAgentTask(messages, model, stream, options) {
 }
 
 async function chatCompletion(messages, model, stream, options) {
-  const { headers, apiHost } = await ensureAuth();
+  const { headers, apiHost } = await ensureAuth(model);
   const modelId = resolveModelId(model);
 
   const traeMessages = messages.map(m => ({

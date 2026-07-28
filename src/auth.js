@@ -5,6 +5,60 @@ const fetch = require('node-fetch');
 const { v4: uuidv4 } = require('./uuid');
 const { decryptAuthData: decryptTcAuthData, isTcEncrypted } = require('./trae-decrypt');
 
+// ─── 模型→edition 路由 ─────────────────────────────────────────────
+// 加载 model-edition.json，按模型名决定用哪个 edition 的 token+host
+let _modelEditionMap = null;
+function loadModelEditionMap() {
+  if (_modelEditionMap) return _modelEditionMap;
+  const candidates = [
+    path.join(__dirname, '..', 'model-edition.json'),
+    path.join(process.cwd(), 'model-edition.json')
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      try {
+        _modelEditionMap = JSON.parse(fs.readFileSync(p, 'utf8'));
+        return _modelEditionMap;
+      } catch (e) {
+        console.warn(`[auth] Failed to parse model-edition.json: ${e.message}`);
+      }
+    }
+  }
+  _modelEditionMap = { default: 'auto', mappings: {} };
+  return _modelEditionMap;
+}
+
+function matchGlob(pattern, name) {
+  // 支持 * 通配符（如 gpt-* 匹配 gpt-5.4）
+  if (pattern === name) return true;
+  if (pattern.indexOf('*') === -1) return false;
+  const regex = new RegExp('^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i');
+  return regex.test(name);
+}
+
+// 按模型解析 edition。返回 'cn' | 'sg' | 'us'，匹配不到返回 null（走默认）
+function resolveEditionForModel(model) {
+  if (!model) return null;
+  const map = loadModelEditionMap();
+  const name = String(model).toLowerCase();
+  // 先精确匹配，再通配符
+  for (const [edition, patterns] of Object.entries(map.mappings || {})) {
+    if (!Array.isArray(patterns)) continue;
+    // 精确
+    for (const p of patterns) {
+      if (String(p).toLowerCase() === name) return edition;
+    }
+  }
+  for (const [edition, patterns] of Object.entries(map.mappings || {})) {
+    if (!Array.isArray(patterns)) continue;
+    for (const p of patterns) {
+      if (matchGlob(String(p).toLowerCase(), name)) return edition;
+    }
+  }
+  return null;
+}
+// ─── 模型→edition 路由 end ─────────────────────────────────────────
+
 // Prefer APPDATA (may be redirected, e.g. D:\AppData\Roaming) over homedir\AppData\Roaming.
 function getRoamingRoot() {
   return process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
@@ -108,56 +162,20 @@ function readStorageJsonByEdition(edition) {
   return JSON.parse(raw);
 }
 
-let _cachedAuthInfo = null;
+let _cachedAuthInfoMap = {}; // { cn: ..., sg: ..., us: ..., manual: ... }
+const _loggedEditionLoad = {}; // 避免同一 edition 反复打印加载日志（dashboard 频繁刷新时）
 
-function getAuthInfo() {
-  if (_cachedAuthInfo && !isTokenExpired(_cachedAuthInfo)) {
-    return _cachedAuthInfo;
-  }
-
-  const edition = detectEdition();
-  const editions = [edition, edition === 'cn' ? 'sg' : 'cn'];
-
-  for (const ed of editions) {
+// 取指定 edition 的 auth 数据（不缓存，不抛异常，失败返回 null）
+function _loadAuthForEdition(ed) {
+  try {
+    const dataDir = resolveProductDataDir(ed);
     try {
-      const dataDir = resolveProductDataDir(ed);
-
-      try {
-        const auth = decryptTcAuthData(dataDir);
+      const auth = decryptTcAuthData(dataDir);
+      if (!_loggedEditionLoad[ed]) {
         console.log(`[auth] Using ${ed.toUpperCase()} edition auth data from ${dataDir} (decrypted)`);
-        _cachedAuthInfo = {
-          token: auth.token,
-          refreshToken: auth.refreshToken,
-          expiredAt: auth.expiredAt,
-          refreshExpiredAt: auth.refreshExpiredAt,
-          tokenReleaseAt: auth.tokenReleaseAt,
-          userId: auth.userId,
-          host: auth.host,
-          userRegion: auth.userRegion,
-          account: auth.account,
-          _edition: ed,
-          _wasEncrypted: true
-        };
-        return _cachedAuthInfo;
-      } catch (decryptErr) {
-        console.log(`[auth] ${ed.toUpperCase()} decryption failed: ${decryptErr.message}, trying plaintext`);
+        _loggedEditionLoad[ed] = true;
       }
-
-      const storage = readStorageJsonByEdition(ed);
-      if (!storage) continue;
-
-      const authKey = 'iCubeAuthInfo://icube.cloudide';
-      const authRaw = storage[authKey];
-      if (!authRaw) continue;
-
-      if (isEncryptedAuthData(authRaw)) {
-        console.log(`[auth] ${ed.toUpperCase()} edition auth data is encrypted and decryption failed, skipping`);
-        continue;
-      }
-
-      const auth = JSON.parse(authRaw);
-      console.log(`[auth] Using ${ed.toUpperCase()} edition auth data (plaintext)`);
-      _cachedAuthInfo = {
+      return {
         token: auth.token,
         refreshToken: auth.refreshToken,
         expiredAt: auth.expiredAt,
@@ -168,56 +186,132 @@ function getAuthInfo() {
         userRegion: auth.userRegion,
         account: auth.account,
         _edition: ed,
-        _wasEncrypted: false
+        _wasEncrypted: true
       };
-      return _cachedAuthInfo;
-    } catch (e) {
-      console.log(`[auth] Failed to read ${ed.toUpperCase()} edition: ${e.message}`);
-      continue;
-    }
-  }
-
-  const manualToken = process.env.TRAE_MANUAL_TOKEN;
-  if (manualToken && manualToken.startsWith('eyJ')) {
-    console.log('[auth] Using manual token from TRAE_MANUAL_TOKEN env');
-    const apiHost = process.env.TRAE_API_HOST || 'https://trae-api-cn.mchost.guru';
-    try {
-      const parts = manualToken.split('.');
-      const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-      const expMs = payload.exp * 1000;
-      const isExpired = Date.now() > expMs;
-      if (isExpired) {
-        console.log('[auth] Manual token is expired, exp:', new Date(expMs).toISOString());
+    } catch (decryptErr) {
+      if (!_loggedEditionLoad[ed + '_fail']) {
+        console.log(`[auth] ${ed.toUpperCase()} decryption failed: ${decryptErr.message}, trying plaintext`);
+        _loggedEditionLoad[ed + '_fail'] = true;
       }
-      return {
-        token: manualToken,
-        refreshToken: null,
-        expiredAt: new Date(expMs).toISOString(),
-        refreshExpiredAt: null,
-        tokenReleaseAt: null,
-        userId: payload.data?.id || null,
-        host: apiHost,
-        userRegion: null,
-        account: null,
-        _edition: 'manual'
-      };
-    } catch (e) {
-      return {
-        token: manualToken,
-        refreshToken: null,
-        expiredAt: null,
-        refreshExpiredAt: null,
-        tokenReleaseAt: null,
-        userId: null,
-        host: apiHost,
-        userRegion: null,
-        account: null,
-        _edition: 'manual'
-      };
+    }
+    const storage = readStorageJsonByEdition(ed);
+    if (!storage) return null;
+    const authKey = 'iCubeAuthInfo://icube.cloudide';
+    const authRaw = storage[authKey];
+    if (!authRaw) return null;
+    if (isEncryptedAuthData(authRaw)) {
+      if (!_loggedEditionLoad[ed + '_enc']) {
+        console.log(`[auth] ${ed.toUpperCase()} edition auth data is encrypted and decryption failed, skipping`);
+        _loggedEditionLoad[ed + '_enc'] = true;
+      }
+      return null;
+    }
+    const auth = JSON.parse(authRaw);
+    if (!_loggedEditionLoad[ed]) {
+      console.log(`[auth] Using ${ed.toUpperCase()} edition auth data (plaintext)`);
+      _loggedEditionLoad[ed] = true;
+    }
+    return {
+      token: auth.token,
+      refreshToken: auth.refreshToken,
+      expiredAt: auth.expiredAt,
+      refreshExpiredAt: auth.refreshExpiredAt,
+      tokenReleaseAt: auth.tokenReleaseAt,
+      userId: auth.userId,
+      host: auth.host,
+      userRegion: auth.userRegion,
+      account: auth.account,
+      _edition: ed,
+      _wasEncrypted: false
+    };
+  } catch (e) {
+    console.log(`[auth] Failed to read ${ed.toUpperCase()} edition: ${e.message}`);
+    return null;
+  }
+}
+
+// 取 manual token（环境变量配置的）
+function _loadManualAuth() {
+  const manualToken = process.env.TRAE_MANUAL_TOKEN;
+  if (!manualToken || !manualToken.startsWith('eyJ')) return null;
+  console.log('[auth] Using manual token from TRAE_MANUAL_TOKEN env');
+  const apiHost = process.env.TRAE_API_HOST || 'https://trae-api-cn.mchost.guru';
+  try {
+    const parts = manualToken.split('.');
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    const expMs = payload.exp * 1000;
+    if (Date.now() > expMs) {
+      console.log('[auth] Manual token is expired, exp:', new Date(expMs).toISOString());
+    }
+    return {
+      token: manualToken,
+      refreshToken: null,
+      expiredAt: new Date(expMs).toISOString(),
+      refreshExpiredAt: null,
+      tokenReleaseAt: null,
+      userId: payload.data?.id || null,
+      host: apiHost,
+      userRegion: null,
+      account: null,
+      _edition: 'manual'
+    };
+  } catch (e) {
+    return {
+      token: manualToken,
+      refreshToken: null,
+      expiredAt: null,
+      refreshExpiredAt: null,
+      tokenReleaseAt: null,
+      userId: null,
+      host: apiHost,
+      userRegion: null,
+      account: null,
+      _edition: 'manual'
+    };
+  }
+}
+
+// 取指定 edition 的 authInfo（带缓存）。edition 为空时走自动检测
+function getAuthInfo(edition) {
+  // 按模型路由：若未指定 edition，上层应先调 resolveEditionForModel
+  const ed = edition || detectEdition();
+
+  // manual token 不按 edition 缓存
+  if (ed === 'manual') {
+    const m = _loadManualAuth();
+    if (m) return m;
+  }
+
+  // 命中缓存
+  if (_cachedAuthInfoMap[ed] && !isTokenExpired(_cachedAuthInfoMap[ed])) {
+    return _cachedAuthInfoMap[ed];
+  }
+
+  // 尝试指定 edition
+  let info = _loadAuthForEdition(ed);
+  if (info) {
+    _cachedAuthInfoMap[ed] = info;
+    return info;
+  }
+
+  // 指定 edition 失败：若未显式指定 edition，回退到另一个 edition
+  if (!edition) {
+    const fallbackEd = ed === 'cn' ? 'sg' : 'cn';
+    if (_cachedAuthInfoMap[fallbackEd] && !isTokenExpired(_cachedAuthInfoMap[fallbackEd])) {
+      return _cachedAuthInfoMap[fallbackEd];
+    }
+    info = _loadAuthForEdition(fallbackEd);
+    if (info) {
+      _cachedAuthInfoMap[fallbackEd] = info;
+      return info;
     }
   }
 
-  throw new Error('No readable auth info found in any edition. CN edition data is encrypted and SG edition data is not available.');
+  // 最后回退到 manual token
+  const m = _loadManualAuth();
+  if (m) return m;
+
+  throw new Error(`No readable auth info found for edition ${ed}. Ensure TRAE ${ed.toUpperCase()} is installed and logged in.`);
 }
 
 function getDeviceIds() {
@@ -264,13 +358,13 @@ const DEFAULT_IDE_VERSION_CN = '3.3.67';
 const DEFAULT_IDE_VERSION_SG = '3.5.51';
 const DEFAULT_IDE_VERSION_CODE = '20260401';
 
-function getApiHost() {
+function getApiHost(edition) {
   const envHost = process.env.TRAE_API_HOST;
   if (envHost) return envHost;
 
   try {
-    const authInfo = getAuthInfo();
-    const authEdition = authInfo._edition;
+    const authInfo = getAuthInfo(edition);
+    const authEdition = authInfo._edition || edition;
     if (authEdition === 'cn') {
       return DEFAULT_HOST_CN;
     }
@@ -278,28 +372,32 @@ function getApiHost() {
     if (region === 'US') return DEFAULT_HOST_US;
     return DEFAULT_HOST_SG;
   } catch (e) {
+    // 按显式 edition 兜底，避免双版本同时使用时回退到错误的 host
+    if (edition === 'cn') return DEFAULT_HOST_CN;
+    if (edition === 'us') return DEFAULT_HOST_US;
     return DEFAULT_HOST_SG;
   }
 }
 
-function getAuthHost() {
+function getAuthHost(edition) {
   const envHost = process.env.TRAE_AUTH_HOST;
   if (envHost) return envHost;
 
   try {
-    const authInfo = getAuthInfo();
+    const authInfo = getAuthInfo(edition);
     if (authInfo._edition === 'cn') {
       return DEFAULT_HOST_CN;
     }
     return DEFAULT_HOST_SG;
   } catch (e) {
+    if (edition === 'cn') return DEFAULT_HOST_CN;
     return DEFAULT_HOST_SG;
   }
 }
 
-async function exchangeToken(refreshToken) {
-  const authInfo = getAuthInfo();
-  const authHost = getAuthHost();
+async function exchangeToken(refreshToken, edition) {
+  const authInfo = getAuthInfo(edition);
+  const authHost = getAuthHost(edition);
   const url = `${authHost}/cloudide/api/v3/trae/oauth/ExchangeToken`;
 
   const body = {
@@ -343,10 +441,10 @@ async function exchangeToken(refreshToken) {
   return data;
 }
 
-let _refreshPromise = null; // Mutex for token refresh
+let _refreshPromiseMap = {}; // Mutex for token refresh, per edition
 
-async function refreshTokenIfNeeded() {
-  const authInfo = getAuthInfo();
+async function refreshTokenIfNeeded(edition) {
+  const authInfo = getAuthInfo(edition);
 
   if (authInfo._edition === 'manual') {
     if (!isTokenExpired(authInfo)) {
@@ -359,16 +457,17 @@ async function refreshTokenIfNeeded() {
     return authInfo;
   }
 
-  // Mutex: if a refresh is already in progress, wait for it
-  if (_refreshPromise) {
-    return _refreshPromise;
+  const mutexKey = authInfo._edition || edition || 'default';
+  // Mutex: if a refresh is already in progress for this edition, wait for it
+  if (_refreshPromiseMap[mutexKey]) {
+    return _refreshPromiseMap[mutexKey];
   }
 
-  _refreshPromise = (async () => {
-    console.log(`Token expiring soon or expired (at ${authInfo.expiredAt}), attempting refresh...`);
+  const refreshPromise = (async () => {
+    console.log(`Token expiring soon or expired (at ${authInfo.expiredAt}), attempting refresh for edition ${mutexKey}...`);
 
     try {
-      const result = await exchangeToken(authInfo.refreshToken);
+      const result = await exchangeToken(authInfo.refreshToken, mutexKey);
       if (result && result.token) {
         const newAuth = {
           ...authInfo,
@@ -381,7 +480,7 @@ async function refreshTokenIfNeeded() {
 
         if (authInfo._wasEncrypted) {
           console.log(`Token refreshed successfully (in-memory only, original data was encrypted), new expiry: ${newAuth.expiredAt}`);
-          _cachedAuthInfo = newAuth;
+          _cachedAuthInfoMap[authInfo._edition] = newAuth;
           return newAuth;
         }
 
@@ -402,7 +501,7 @@ async function refreshTokenIfNeeded() {
         const storagePath = getStorageJsonPath(authInfo._edition);
         fs.writeFileSync(storagePath, JSON.stringify(storage, null, '\t'), 'utf-8');
         console.log(`Token refreshed successfully, new expiry: ${newAuth.expiredAt}`);
-        _cachedAuthInfo = newAuth;
+        _cachedAuthInfoMap[authInfo._edition] = newAuth;
         return newAuth;
       } else {
         console.error('Token refresh returned no token');
@@ -417,13 +516,14 @@ async function refreshTokenIfNeeded() {
         throw new Error('Token expired and refresh failed. Please restart Trae IDE to re-authenticate.');
       }
     } finally {
-      _refreshPromise = null; // Clear mutex
+      _refreshPromiseMap[mutexKey] = null; // Clear mutex for this edition
     }
 
     return authInfo;
   })();
 
-  return _refreshPromise;
+  _refreshPromiseMap[mutexKey] = refreshPromise;
+  return refreshPromise;
 }
 
 function findManifestPaths() {
@@ -588,6 +688,39 @@ function hashDeviceId(machineId) {
   return Math.abs(hash).toString().padStart(19, '0');
 }
 
+// 探测各 edition 的可用性：是否安装、是否登录、token 是否过期
+// 返回 { cn: {available, loggedIn, tokenValid, account, expiredAt}, sg: {...} }
+function getEditionStatus() {
+  const editions = ['cn', 'sg'];
+  const result = {};
+  for (const ed of editions) {
+    const entry = { available: false, loggedIn: false, tokenValid: false, account: null, expiredAt: null };
+    try {
+      const dataDir = resolveProductDataDir(ed);
+      const storagePath = path.join(dataDir, 'User', 'globalStorage', 'storage.json');
+      entry.available = fs.existsSync(storagePath);
+      if (!entry.available) {
+        result[ed] = entry;
+        continue;
+      }
+      // 优先用缓存（避免 dashboard 每秒刷新时反复解密+打日志）
+      let info = _cachedAuthInfoMap[ed];
+      if (!info || isTokenExpired(info)) {
+        info = _loadAuthForEdition(ed);
+        if (info) _cachedAuthInfoMap[ed] = info;
+      }
+      if (info) {
+        entry.loggedIn = true;
+        entry.tokenValid = !isTokenExpired(info);
+        entry.account = info.account || null;
+        entry.expiredAt = info.expiredAt || null;
+      }
+    } catch (e) {}
+    result[ed] = entry;
+  }
+  return result;
+}
+
 module.exports = {
   getTraeDataDir,
   getStorageJsonPath,
@@ -608,5 +741,8 @@ module.exports = {
   hashDeviceId,
   detectEdition,
   isSoloProduct,
-  extractSoloDeviceId
+  extractSoloDeviceId,
+  resolveEditionForModel,
+  loadModelEditionMap,
+  getEditionStatus
 };
