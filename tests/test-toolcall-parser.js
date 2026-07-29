@@ -128,6 +128,25 @@ const testCases = [
     input: 'write({"content":"hello world","filePath":"a.txt"}',
     expect: { name: 'write', params: { content: 'hello world', filePath: 'a.txt' } }
   },
+  // Format 19: 双重标签 — 模型输出 <tool_call>toolcall>{...}</toolcall>
+  // 流过滤器匹配外层后 inner 残留 "toolcall>{...}"，需剥离前缀
+  {
+    name: 'F19-double-tag-prefix',
+    input: 'toolcall>{"name":"bash","params":{"command":"Get-ChildItem -Path C:\\\\Codes\\\\test","workdir":"C:\\\\Codes"}}',
+    expect: { name: 'bash', params: { command: 'Get-ChildItem -Path C:\\Codes\\test', workdir: 'C:\\Codes' } }
+  },
+  // Format 20: 双重标签 tool_call> 变体
+  {
+    name: 'F20-double-tag-prefix-underscore',
+    input: 'tool_call>{"name":"read","params":{"file_path":"a.txt"}}',
+    expect: { name: 'read', params: { file_path: 'a.txt' } }
+  },
+  // Format 21: JSON 缺少闭合 }} — 模型截断时漏掉
+  {
+    name: 'F21-missing-close-braces',
+    input: '{"name":"bash","params":{"command":"adb shell \'su -c \\"sed -i s/old/new/g file\\"\'"',
+    expect: { name: 'bash', params: { command: 'adb shell \'su -c "sed -i s/old/new/g file"\'' } }
+  },
 ];
 
 console.log('=== Toolcall Parser Unit Test ===\n');

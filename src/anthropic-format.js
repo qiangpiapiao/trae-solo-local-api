@@ -324,6 +324,24 @@ function parseXmlTagParamsToolcall(inner) {
   return { name: nameLine, params };
 }
 
+// 计算缺失的闭合 } 数量（忽略字符串内的 {/}）
+// 模型有时在 toolcall 截断时漏掉 }}，需要补全才能解析
+function countMissingCloseBraces(str) {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (escape) { escape = false; continue; }
+    if (c === '\\' && inString) { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === '{') depth++;
+    else if (c === '}') depth--;
+  }
+  return depth > 0 ? depth : 0;
+}
+
 // Lenient extraction for malformed JSON with unescaped quotes inside string values.
 // Models sometimes generate: {"name":"bash","params":{"command":"node -e "code""}}
 // where the " around code are not escaped as \", breaking JSON.parse.
@@ -388,7 +406,12 @@ function lenientExtractToolcall(inner) {
 }
 
 function parseToolcallContent(inner) {
-  const trimmed = inner.trim();
+  let trimmed = inner.trim();
+
+  // 剥离残留的标签前缀：模型有时输出双重标签如 "<tool_call>toolcall>{...}"
+  // 流过滤器匹配外层 <tool_call>...</toolcall> 后，inner 会残留 "toolcall>{...}"
+  // 这里剥离开头的 toolcall>/tool_call>/toolcall/tool_call 碎片
+  trimmed = trimmed.replace(/^(?:tool_call|toolcall)\s*>?\s*/i, '');
 
   // 1. Try JSON first (the format we asked the model to use)
   try {
@@ -398,21 +421,21 @@ function parseToolcallContent(inner) {
   }
 
   // 2. Try XML with name attribute: <toolcall name="...">
-  const namedResult = parseXmlNamedToolcall(inner);
+  const namedResult = parseXmlNamedToolcall(trimmed);
   if (namedResult) {
     console.log(`[anthropic-format] Parsed XML-named toolcall: ${namedResult.name}`);
     return namedResult;
   }
 
   // 3. Try XML arg_key/arg_value format: ToolName key</arg_key><arg_value>value</arg_value>
-  const argKeyResult = parseXmlArgKeyToolcall(inner);
+  const argKeyResult = parseXmlArgKeyToolcall(trimmed);
   if (argKeyResult) {
     console.log(`[anthropic-format] Parsed XML arg_key toolcall: ${argKeyResult.name}`);
     return argKeyResult;
   }
 
   // 4. Try XML attribute format: ToolName key="value" key2="value2"
-  const attrResult = parseXmlAttributeToolcall(inner);
+  const attrResult = parseXmlAttributeToolcall(trimmed);
   if (attrResult) {
     console.log(`[anthropic-format] Parsed XML-attribute toolcall: ${attrResult.name}`);
     return attrResult;
@@ -421,7 +444,18 @@ function parseToolcallContent(inner) {
   // 5. Try lenient extraction for malformed JSON with unescaped quotes
   //    (e.g. model puts node -e "code" without escaping inner quotes)
   if (trimmed.startsWith('{')) {
-    const lenientResult = lenientExtractToolcall(inner);
+    // 5a. 自动补全缺失的闭合 } — 模型有时在 toolcall 截断时漏掉 }}
+    //     用花括号配对计算（忽略字符串内的 {/}）确定缺失数量
+    const missing = countMissingCloseBraces(trimmed);
+    if (missing > 0) {
+      const fixed = trimmed + '}'.repeat(missing);
+      const lenientFixed = lenientExtractToolcall(fixed);
+      if (lenientFixed) {
+        console.log(`[anthropic-format] Parsed lenient toolcall (补全 ${missing} 个 }): ${lenientFixed.name}`);
+        return lenientFixed;
+      }
+    }
+    const lenientResult = lenientExtractToolcall(trimmed);
     if (lenientResult) {
       console.log(`[anthropic-format] Parsed lenient toolcall: ${lenientResult.name}`);
       return lenientResult;
@@ -430,7 +464,7 @@ function parseToolcallContent(inner) {
 
   // 5b. Try XML tag-params format: ToolName\n<param>value</param>\n<param2>value2</param2>
   //     (model uses XML tags for params instead of JSON, common with glm models)
-  const tagParamsResult = parseXmlTagParamsToolcall(inner);
+  const tagParamsResult = parseXmlTagParamsToolcall(trimmed);
   if (tagParamsResult) {
     console.log(`[anthropic-format] Parsed XML tag-params toolcall: ${tagParamsResult.name}`);
     return tagParamsResult;
@@ -438,7 +472,7 @@ function parseToolcallContent(inner) {
 
   // 5c. Try function-call format: funcName({"key":"value"}) 或 funcName(key="value")
   //     (模型有时生成 <tool_call>glob({"path":"..."})</arg_value> 这类非标准格式)
-  const funcCallResult = parseFunctionCallToolcall(inner);
+  const funcCallResult = parseFunctionCallToolcall(trimmed);
   if (funcCallResult) {
     console.log(`[anthropic-format] Parsed function-call toolcall: ${funcCallResult.name}`);
     return funcCallResult;
